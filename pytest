@@ -1,0 +1,368 @@
+"""Tests that need no hardware: jaw mapping, resampling, Brave parsing, and a full
+conversation against a fake realtime server.
+
+    pip install pytest websockets numpy websocket-client
+    python3 -m pytest tests
+"""
+import asyncio
+import base64
+import io
+import json
+import os
+import socket
+import sys
+import threading
+import time
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import talking_prop as tp  # noqa: E402
+
+
+def chunk(value, n=320):
+    return np.full(n, value, dtype=np.int16)
+
+
+# ---------------------------------------------------------------- jaw
+def test_jaw_levels_with_default_config():
+    jaw = tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False)
+    assert (jaw.closed, jaw.open) == (90, 0)
+    assert [jaw.target(chunk(v)) for v in (0, 1600, 2600, 4000)] == [90, 60.0, 30.0, 0]
+    assert jaw.target(chunk(-32768)) == 0  # no int16 overflow in abs()
+    assert jaw.target(np.array([], dtype=np.int16)) == 90
+
+
+def test_jaw_reversed_angles(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text("[SERVO]\nmin_angle = 270\nmax_angle = 0\n")
+    jaw = tp.Jaw(tp.load_chatterpi_config(str(ini)), enabled=False)
+    assert (jaw.closed, jaw.open) == (270, 0)
+    assert jaw.target(chunk(2600)) == 90.0
+
+
+def test_single_threshold_style(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text("[CONTROLLER]\nstyle = 0\nthreshold = 2000\n")
+    jaw = tp.Jaw(tp.load_chatterpi_config(str(ini)), enabled=False)
+    assert jaw.target(chunk(1999)) == jaw.closed
+    assert jaw.target(chunk(2001)) == jaw.open
+
+
+def test_resampling():
+    assert len(tp.downsample(np.arange(960, dtype=np.int16), 3)) == 320
+    assert len(tp.upsample(chunk(1), 3)) == 960
+    with pytest.raises(SystemExit):
+        tp.rate_factor(44100)
+
+
+# ---------------------------------------------------------------- devices
+class FakePyAudio:
+    devices = [
+        {"index": 0, "name": "bcm2835 Headphones", "maxInputChannels": 0, "maxOutputChannels": 8},
+        {"index": 1, "name": "USB Audio Device", "maxInputChannels": 1, "maxOutputChannels": 2},
+        {"index": 2, "name": "sysdefault", "maxInputChannels": 128, "maxOutputChannels": 128},
+        {"index": 3, "name": "default", "maxInputChannels": 128, "maxOutputChannels": 128},
+    ]
+
+    def get_device_count(self):
+        return len(self.devices)
+
+    def get_device_info_by_index(self, i):
+        return self.devices[i]
+
+
+def test_find_device():
+    pa = FakePyAudio()
+    assert tp.find_device(pa, None, True) is None
+    assert tp.find_device(pa, "default", True) == 3  # exact name beats "sysdefault"
+    assert tp.find_device(pa, "usb", False) == 1
+    for bad in ("0", "9", "nope"):
+        with pytest.raises(SystemExit):
+            tp.find_device(pa, bad, True)
+
+
+# ---------------------------------------------------------------- brave
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_brave(request, timeout):
+    assert request.get_header("X-subscription-token") == "KEY"
+    assert "safesearch=strict" in request.full_url
+    return FakeResponse(json.dumps({"web": {"results": [{
+        "title": "Oxnard <strong>Weather</strong>",
+        "url": "https://weather.example.com/oxnard",
+        "description": "Sunny, high of 72&deg;F &amp; light wind",
+    }]}}).encode())
+
+
+def test_brave_search_parsing():
+    result = tp.brave_search("KEY", "oxnard weather", opener=fake_brave)
+    assert result["results"][0] == {
+        "title": "Oxnard Weather",
+        "snippet": "Sunny, high of 72°F & light wind",
+        "source": "weather.example.com",
+    }
+
+
+def test_brave_search_failure():
+    def broken(request, timeout):
+        raise OSError("network down")
+
+    assert "error" in tp.brave_search("KEY", "x", opener=broken)
+
+
+def test_brave_key_loading(tmp_path, monkeypatch):
+    key_file = tmp_path / "brave_key.txt"
+    key_file.write_text("  FILEKEY \n")
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    assert tp.load_brave_key(str(key_file)) == "FILEKEY"
+    monkeypatch.setenv("BRAVE_API_KEY", "ENVKEY")
+    assert tp.load_brave_key(str(key_file)) == "ENVKEY"
+    monkeypatch.delenv("BRAVE_API_KEY")
+    args = tp.parse_args(["--brave-key-file", str(key_file), "--no-search"])
+    assert args.brave_key == ""
+
+
+# ---------------------------------------------------------------- end to end
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def run_fake_server(handler, port, seconds):
+    websockets = pytest.importorskip("websockets")
+
+    async def serve():
+        async with websockets.serve(handler, "127.0.0.1", port):
+            await asyncio.sleep(seconds)
+
+    threading.Thread(target=lambda: asyncio.run(serve()), daemon=True).start()
+    time.sleep(0.5)
+
+
+def start_client(port, extra_args=()):
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo", "--no-search",
+                          "--mic-rate", "48000", "--out-rate", "48000", *extra_args])
+    jaw = tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False)
+    moves = []
+    jaw.move = moves.append
+    app = tp.TalkingProp(args, jaw)
+    for fn in (app.run_socket, app.send_mic, app.watch_speaking):
+        threading.Thread(target=fn, daemon=True).start()
+    return app, moves
+
+
+def test_conversation_plays_reply_moves_jaw_and_mutes_mic():
+    port = free_port()
+    reply = (np.sin(np.arange(16000) * 0.2) * 9000).astype(np.int16).tobytes()  # 1 s
+    got = {"session": None, "appends": 0, "loud_while_talking": 0}
+
+    async def handler(ws):
+        sent = False
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                got["session"] = event["session"]
+            elif event["type"] == "input_audio_buffer.append":
+                got["appends"] += 1
+                pcm = np.frombuffer(base64.b64decode(event["audio"]), dtype=np.int16)
+                if got.get("talking") and pcm.any():
+                    got["loud_while_talking"] += 1
+                if got["appends"] == 5 and not sent:
+                    sent = True
+                    for i in range(0, len(reply), 3200):
+                        await ws.send(json.dumps({"type": "response.output_audio.delta",
+                                                  "delta": base64.b64encode(reply[i:i + 3200]).decode()}))
+                    got["talking"] = True
+
+    run_fake_server(handler, port, 4)
+    app, moves = start_client(port, ["--voice", "pirate"])
+    played = 0
+    mic = (np.ones(1920, dtype=np.int16) * 500).tobytes()  # 40 ms at 48 kHz, never silent
+    end = time.time() + 2
+    while time.time() < end:
+        app.on_mic(mic, 1920, None, None)
+        for _ in range(2):
+            out, _ = app.on_speaker(None, 960, None, None)
+            assert len(out) == 960 * 2
+            played += int(np.frombuffer(out, dtype=np.int16).any())
+        time.sleep(0.04)
+        if played >= 45:
+            got["talking"] = False
+    session = got["session"]
+    assert session["audio"]["output"]["voice"] == "pirate"
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": None}
+    assert [tool["name"] for tool in session["tools"]] == ["get_current_time"]
+    assert got["appends"] > 20
+    assert played >= 45  # about one second of 20 ms playback callbacks
+    assert any(angle != 90 for angle in moves)
+
+
+def test_search_tool_round_trip(tmp_path, monkeypatch):
+    key_file = tmp_path / "brave_key.txt"
+    key_file.write_text("KEY")
+    real = tp.brave_search
+    monkeypatch.setattr(tp, "brave_search", lambda key, q: real(key, q, opener=fake_brave))
+    port = free_port()
+    log = []
+
+    async def handler(ws):
+        asked = False
+        async for raw in ws:
+            event = json.loads(raw)
+            kind = event["type"]
+            if kind == "session.update":
+                log.append(("tools", [t["name"] for t in event["session"]["tools"]]))
+            elif kind == "input_audio_buffer.append" and not asked:
+                asked = True
+                await ws.send(json.dumps({"type": "response.created"}))
+                await ws.send(json.dumps({"type": "response.function_call_arguments.done", "name": "web_search",
+                                          "arguments": json.dumps({"query": "oxnard weather"}),
+                                          "call_id": "c1"}))
+                await asyncio.sleep(0.3)  # the result must wait for response.done
+                log.append(("done", time.monotonic()))
+                await ws.send(json.dumps({"type": "response.done"}))
+            elif kind == "conversation.item.create":
+                log.append(("output", time.monotonic(), event["item"]))
+            elif kind == "response.create":
+                log.append(("response.create",))
+
+    run_fake_server(handler, port, 3)
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo",
+                          "--brave-key-file", str(key_file)])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    for fn in (app.run_socket, app.send_mic):
+        threading.Thread(target=fn, daemon=True).start()
+    end = time.time() + 2
+    while time.time() < end:
+        app.on_mic((np.ones(640, dtype=np.int16) * 300).tobytes(), 640, None, None)
+        time.sleep(0.04)
+    assert ("tools", ["get_current_time", "web_search"]) in log
+    output = next(e for e in log if e[0] == "output")
+    done = next(e for e in log if e[0] == "done")
+    assert output[1] >= done[1]
+    assert output[2]["call_id"] == "c1"
+    assert json.loads(output[2]["output"])["results"][0]["source"] == "weather.example.com"
+    assert ("response.create",) in log
+
+
+def test_current_time_tool():
+    now = tp.current_time()
+    assert set(now) == {"date", "time", "timezone"}
+    assert not now["time"].startswith("0")
+
+
+def test_kid_safe_session_rule():
+    args = tp.parse_args(["--url", "ws://x", "--no-servo", "--no-search", "--kid-safe"])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    instructions = app.session_update()["session"]["instructions"]
+    assert instructions.startswith(tp.KID_SAFE_RULE)
+    assert tp.current_time()["date"] in instructions
+
+
+def test_clock_refresh_resends_session_while_idle():
+    port = free_port()
+    updates = []
+
+    async def handler(ws):
+        async for raw in ws:
+            if json.loads(raw)["type"] == "session.update":
+                updates.append(time.monotonic())
+
+    run_fake_server(handler, port, 4)
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo", "--no-search",
+                          "--clock-refresh", "1"])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    for fn in (app.run_socket, app.refresh_clock):
+        threading.Thread(target=fn, daemon=True).start()
+    time.sleep(3.5)
+    assert len(updates) >= 3  # the initial one plus refreshes
+    app.stop.set()
+
+
+@pytest.mark.parametrize("reply", [
+    "I'll check the latest gossip from Texas for ye, me hearties.",
+    "I'll be checkin' the wind for the latest happenin's in Nevada, hold on a tick!",
+    "Let me check what's brewin' in California, me hearty.",
+    "I'll scour the winds for the latest tidings from Oregon right now! Hold fast, matey.",
+])
+def test_promise_detected(reply):
+    assert tp.promised_to_search(reply)
+
+
+@pytest.mark.parametrize("reply", [
+    "It be 2:43 PM on this fine Thursday, October 8th, 2026.",
+    "Ahoy there, matey! I've been waitin' for a soul to chat with.",
+    "Aye, me name's Captain Mortimer Bones.",
+    "Seems the winds be blowin' fierce over the strait today.",
+    "I'll tell ye a tale of the high seas.",
+])
+def test_ordinary_reply_not_a_promise(reply):
+    assert not tp.promised_to_search(reply)
+
+
+def test_fallback_search_when_model_only_promises(tmp_path, monkeypatch):
+    key_file = tmp_path / "brave_key.txt"
+    key_file.write_text("KEY")
+    real = tp.brave_search
+    queries = []
+
+    def fake_search(key, q):
+        queries.append(q)
+        return real(key, q, opener=fake_brave)
+
+    monkeypatch.setattr(tp, "brave_search", fake_search)
+    port = free_port()
+    log = []
+
+    async def handler(ws):
+        turn = 0
+        async for raw in ws:
+            event = json.loads(raw)
+            kind = event["type"]
+            if kind == "input_audio_buffer.append" and turn == 0:
+                turn = 1
+                await ws.send(json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                                          "transcript": "What's the news in Oregon?"}))
+                await ws.send(json.dumps({"type": "response.created"}))
+                await ws.send(json.dumps({"type": "response.output_audio_transcript.done",
+                                          "transcript": "I'll scour the winds for the latest from Oregon!"}))
+                await ws.send(json.dumps({"type": "response.done"}))
+            elif kind == "input_audio_buffer.append" and turn == 1 and log:
+                turn = 2
+                # an ordinary answer must not trigger another search
+                await ws.send(json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                                          "transcript": "What's your name?"}))
+                await ws.send(json.dumps({"type": "response.created"}))
+                await ws.send(json.dumps({"type": "response.output_audio_transcript.done",
+                                          "transcript": "Captain Bones, at yer service."}))
+                await ws.send(json.dumps({"type": "response.done"}))
+            elif kind == "conversation.item.create":
+                log.append(event["item"])
+            elif kind == "response.create":
+                log.append("response.create")
+
+    run_fake_server(handler, port, 4)
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo",
+                          "--brave-key-file", str(key_file)])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    for fn in (app.run_socket, app.send_mic):
+        threading.Thread(target=fn, daemon=True).start()
+    end = time.time() + 3
+    while time.time() < end:
+        app.on_mic((np.ones(640, dtype=np.int16) * 300).tobytes(), 640, None, None)
+        time.sleep(0.04)
+    app.stop.set()
+    assert queries == ["What's the news in Oregon?"]
+    item = log[0]
+    assert item["type"] == "message" and item["role"] == "user"
+    assert "weather.example.com" in item["content"][0]["text"]
+    assert log[1] == "response.create"

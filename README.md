@@ -139,6 +139,8 @@ sudo apt update
 sudo apt install -y git python3-pyaudio python3-numpy python3-gpiozero python3-pigpio python3-websocket
 git clone https://github.com/stoney66/talking-prop.git
 cd talking-prop
+cp config.example.ini config.ini
+cp persona.example.txt persona.txt
 ```
 
 If you already use ChatterPi, copy its `config.ini` instead of the example; your servo calibration carries over.
@@ -232,17 +234,21 @@ You'll see `Connected to ...`, then `You:` and `Prop:` lines as the conversation
 | `--persona` | Personality file (default `persona.txt`). |
 | `--config` | Servo config file (default `config.ini`). |
 | `--barge-in` | Keep the mic live while the prop talks, so people can interrupt. Only with a mic that won't pick up the prop's own speaker. |
+| `--mic-gain` | Multiply the mic signal in software, e.g. `3` for a quiet headset mic. Raise the mixer level first; use this only if that's already at maximum. |
 | `--tail` | Seconds the mic stays muted after the prop stops talking (default 0.4). Raise it, e.g. to 0.8, for loud speakers or echoey spaces. |
 | `--mic-device`, `--out-device` | Audio device by number or part of its name. Usually not needed; see [Audio](#audio). |
 | `--mic-rate`, `--out-rate` | Device sample rate: 16000, 32000 or 48000 (default 16000). |
 | `--language` | Speech recognition language (default `en`). |
 | `--token` | Bearer token, if your server requires one (or set `TALKING_PROP_TOKEN`). |
 | `--brave-key-file` | Where to find the Brave key (default `brave_key.txt`). |
+| `--no-search-fallback` | Don't search on the model's behalf when it says it will look something up but doesn't call the tool. |
+| `--kid-safe` | Keep answers family-friendly: adds a rule to the instructions and tells the model to skip crime, violence and other upsetting items in search results. Recommended around children. |
+| `--clock-refresh` | Seconds between updates of the time given to the model (default 60). |
 | `--no-search` | Turn web search off even if a key is present. |
 | `--no-servo` | Run without touching GPIO, e.g. on a desktop. |
 | `--list-devices` | Print audio devices and exit. |
 | `--jaw-test` | Step the jaw through its positions and exit. |
-| `--debug` | Print every event type the server sends. |
+| `--debug` | Print every event the server sends, plus a mic level meter once a second. |
 
 ### Start at boot
 
@@ -273,7 +279,7 @@ The service and a hand-run copy can't share the mic and servo, so stop one befor
 - **Put the most important rule first.** Smaller models follow early rules more reliably; "never ask the listener a question" works better at the top.
 - **Write the dialect into the rules** (e.g. "ye" for "you") to reinforce an accent in the cloned voice.
 
-The current date and time are added automatically.
+The current date and time are added automatically and refreshed every minute while the prop is idle (`--clock-refresh`), so "what time is it?" works even with models that rarely call tools. A `get_current_time` tool is offered as well.
 
 ## Web search
 
@@ -285,7 +291,7 @@ echo 'YOUR_KEY' > brave_key.txt && chmod 600 brave_key.txt
 
 The prop then gets a `web_search` tool and uses it for current information: weather, news, scores, opening hours. Each search shows in the log as `Search: ...`. Results reach the model as title, snippet and site name only, so it can't read out web addresses. SafeSearch is always strict.
 
-If your model rarely searches, add a line to the persona such as "For anything about today, the weather or the news, use web_search first."
+Smaller models sometimes say they'll look something up ("I'll check the latest from Oregon...") without actually calling the tool. When a reply sounds like that and no search happened, talking-prop runs the search itself with the visitor's question and has the model answer from the results, so the prop follows its promise with a real answer. Turn this off with `--no-search-fallback`. A persona rule such as "For anything about today, the weather or the news, use web_search first" also helps.
 
 `brave_key.txt` is in `.gitignore`; keep it out of any repo.
 
@@ -339,6 +345,7 @@ To switch between voices, keep the other pair commented out in the compose file 
 | It doesn't hear people, or hears every noise | Check the [mic level](#mic-level). |
 | Replies are long or ignore persona rules | Shorten the persona and put the key rule first. |
 | It never searches | No key found (the connect line says `web search off`), or the model prefers answering from memory; add a search rule to the persona. |
+| It says "I'll check" and then answers a moment later | That's the search fallback covering for a model that didn't call the tool. Normal. |
 | The voice reads out `<think>` or reasoning | Turn thinking off on the LLM. |
 | Voice design: `CUDA out of memory` | Stop the speech-to-speech server while generating, or use another GPU (`device_map="cuda:1"`). |
 | Server won't start after editing the transcript | The YAML transcript must be one quoted string on one line. Check with `docker compose config`. |
