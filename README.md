@@ -139,8 +139,6 @@ sudo apt update
 sudo apt install -y git python3-pyaudio python3-numpy python3-gpiozero python3-pigpio python3-websocket
 git clone https://github.com/stoney66/talking-prop.git
 cd talking-prop
-cp config.example.ini config.ini
-cp persona.example.txt persona.txt
 ```
 
 If you already use ChatterPi, copy its `config.ini` instead of the example; your servo calibration carries over.
