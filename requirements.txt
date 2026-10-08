@@ -1,0 +1,6 @@
+# On Raspberry Pi OS, install these with apt instead (see the README).
+numpy
+pyaudio
+websocket-client
+gpiozero
+pigpio

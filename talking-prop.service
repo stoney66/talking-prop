@@ -1,0 +1,20 @@
+# systemd unit: starts talking-prop at boot and restarts it if it stops.
+# Edit User, WorkingDirectory and the --url, then:
+#   sudo cp talking-prop.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now talking-prop
+
+[Unit]
+Description=talking-prop live voice conversation
+After=network-online.target pigpiod.service sound.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/talking-prop
+ExecStart=/usr/bin/python3 -u talking_prop.py --url ws://192.168.86.10:8765/v1/realtime
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

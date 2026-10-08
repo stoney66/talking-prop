@@ -1,0 +1,15 @@
+# systemd unit for a pigpio daemon built from source (see the README).
+#   sudo cp pigpiod.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pigpiod
+
+[Unit]
+Description=pigpio daemon
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/pigpiod -l
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
