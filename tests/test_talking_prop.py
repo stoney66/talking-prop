@@ -200,7 +200,7 @@ def test_conversation_plays_reply_moves_jaw_and_mutes_mic():
     session = got["session"]
     assert session["audio"]["output"]["voice"] == "pirate"
     assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": None}
-    assert session["tools"] == []
+    assert [tool["name"] for tool in session["tools"]] == ["get_current_time"]
     assert got["appends"] > 20
     assert played >= 45  # about one second of 20 ms playback callbacks
     assert any(angle != 90 for angle in moves)
@@ -245,10 +245,205 @@ def test_search_tool_round_trip(tmp_path, monkeypatch):
     while time.time() < end:
         app.on_mic((np.ones(640, dtype=np.int16) * 300).tobytes(), 640, None, None)
         time.sleep(0.04)
-    assert ("tools", ["web_search"]) in log
+    assert ("tools", ["get_current_time", "web_search"]) in log
     output = next(e for e in log if e[0] == "output")
     done = next(e for e in log if e[0] == "done")
     assert output[1] >= done[1]
     assert output[2]["call_id"] == "c1"
     assert json.loads(output[2]["output"])["results"][0]["source"] == "weather.example.com"
     assert ("response.create",) in log
+
+
+def test_current_time_tool():
+    now = tp.current_time()
+    assert set(now) == {"date", "time", "timezone"}
+    assert not now["time"].startswith("0")
+
+
+def test_kid_safe_session_rule():
+    args = tp.parse_args(["--url", "ws://x", "--no-servo", "--no-search", "--kid-safe"])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    instructions = app.session_update()["session"]["instructions"]
+    assert instructions.startswith(tp.KID_SAFE_RULE)
+    assert tp.current_time()["date"] in instructions
+
+
+def test_clock_refresh_resends_session_while_idle():
+    port = free_port()
+    updates = []
+
+    async def handler(ws):
+        async for raw in ws:
+            if json.loads(raw)["type"] == "session.update":
+                updates.append(time.monotonic())
+
+    run_fake_server(handler, port, 4)
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo", "--no-search",
+                          "--clock-refresh", "1"])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    for fn in (app.run_socket, app.refresh_clock):
+        threading.Thread(target=fn, daemon=True).start()
+    time.sleep(3.5)
+    assert len(updates) >= 3  # the initial one plus refreshes
+    app.stop.set()
+
+
+@pytest.mark.parametrize("reply", [
+    "I'll check the latest gossip from Texas for ye, me hearties.",
+    "I'll be checkin' the wind for the latest happenin's in Nevada, hold on a tick!",
+    "Let me check what's brewin' in California, me hearty.",
+    "I'll scour the winds for the latest tidings from Oregon right now! Hold fast, matey.",
+])
+def test_promise_detected(reply):
+    assert tp.promised_to_search(reply)
+
+
+@pytest.mark.parametrize("reply", [
+    "It be 2:43 PM on this fine Thursday, October 8th, 2026.",
+    "Ahoy there, matey! I've been waitin' for a soul to chat with.",
+    "Aye, me name's Captain Mortimer Bones.",
+    "Seems the winds be blowin' fierce over the strait today.",
+    "I'll tell ye a tale of the high seas.",
+])
+def test_ordinary_reply_not_a_promise(reply):
+    assert not tp.promised_to_search(reply)
+
+
+def test_fallback_search_when_model_only_promises(tmp_path, monkeypatch):
+    key_file = tmp_path / "brave_key.txt"
+    key_file.write_text("KEY")
+    real = tp.brave_search
+    queries = []
+
+    def fake_search(key, q):
+        queries.append(q)
+        return real(key, q, opener=fake_brave)
+
+    monkeypatch.setattr(tp, "brave_search", fake_search)
+    port = free_port()
+    log = []
+
+    async def handler(ws):
+        turn = 0
+        async for raw in ws:
+            event = json.loads(raw)
+            kind = event["type"]
+            if kind == "input_audio_buffer.append" and turn == 0:
+                turn = 1
+                await ws.send(json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                                          "transcript": "What's the news in Oregon?"}))
+                await ws.send(json.dumps({"type": "response.created"}))
+                await ws.send(json.dumps({"type": "response.output_audio_transcript.done",
+                                          "transcript": "I'll scour the winds for the latest from Oregon!"}))
+                await ws.send(json.dumps({"type": "response.done"}))
+            elif kind == "input_audio_buffer.append" and turn == 1 and log:
+                turn = 2
+                # an ordinary answer must not trigger another search
+                await ws.send(json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                                          "transcript": "What's your name?"}))
+                await ws.send(json.dumps({"type": "response.created"}))
+                await ws.send(json.dumps({"type": "response.output_audio_transcript.done",
+                                          "transcript": "Captain Bones, at yer service."}))
+                await ws.send(json.dumps({"type": "response.done"}))
+            elif kind == "conversation.item.create":
+                log.append(event["item"])
+            elif kind == "response.create":
+                log.append("response.create")
+
+    run_fake_server(handler, port, 4)
+    args = tp.parse_args(["--url", "ws://127.0.0.1:%d/v1/realtime" % port, "--no-servo",
+                          "--brave-key-file", str(key_file)])
+    app = tp.TalkingProp(args, tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False))
+    for fn in (app.run_socket, app.send_mic):
+        threading.Thread(target=fn, daemon=True).start()
+    end = time.time() + 3
+    while time.time() < end:
+        app.on_mic((np.ones(640, dtype=np.int16) * 300).tobytes(), 640, None, None)
+        time.sleep(0.04)
+    app.stop.set()
+    assert queries == ["What's the news in Oregon?"]
+    item = log[0]
+    assert item["type"] == "message" and item["role"] == "user"
+    assert "weather.example.com" in item["content"][0]["text"]
+    assert log[1] == "response.create"
+
+
+# ---------------------------------------------------------------- eye servos
+def test_eye_config_defaults_and_parsing(tmp_path):
+    assert tp.load_eye_config("/nonexistent.ini")["enabled"] is False
+    ini = tmp_path / "config.ini"
+    ini.write_text("[EYE_SERVOS]\nenabled = ON\npan_pin = 5\ntilt_pin = 6\npan_range = 2\ntilt_range = 0.3\n")
+    cfg = tp.load_eye_config(str(ini))
+    assert cfg["enabled"] and (cfg["pan_pin"], cfg["tilt_pin"]) == (5, 6)
+    assert cfg["pan_range"] == 1.0  # clamped
+    assert cfg["tilt_range"] == 0.3
+
+
+class FakeServo:
+    def __init__(self):
+        self.value = None
+        self.history = []
+
+    def __setattr__(self, name, val):
+        object.__setattr__(self, name, val)
+        if name == "value" and hasattr(self, "history"):
+            self.history.append(val)
+
+
+def make_eyes(**overrides):
+    settings = tp.load_eye_config("/nonexistent.ini")
+    settings.update(enabled=True, min_hold=0.1, max_hold=0.2, **overrides)
+    eyes = tp.Eyes(settings, enabled=False, rng=__import__("random").Random(1))
+    eyes.active = True
+    eyes.pan, eyes.tilt = FakeServo(), FakeServo()
+    return eyes
+
+
+def test_eye_targets_stay_in_range():
+    eyes = make_eyes(pan_range=0.8, tilt_range=0.4)
+    for _ in range(200):
+        target = eyes.new_target()
+        assert abs(target[0]) <= 0.8 and abs(target[1]) <= 0.4
+        assert abs(target[0] - eyes.target[0]) + abs(target[1] - eyes.target[1]) > 0.25
+        eyes.target = target
+
+
+def test_eyes_move_only_while_talking_then_centre_and_release():
+    eyes = make_eyes()
+    worker = threading.Thread(target=eyes.run, daemon=True)
+    worker.start()
+    time.sleep(0.3)
+    assert eyes.pan.history == []  # idle: no movement
+    eyes.set_talking(True)
+    time.sleep(1.0)
+    moving = [v for v in eyes.pan.history if v is not None]
+    assert moving and max(abs(v) for v in moving) > 0.1
+    eyes.set_talking(False)
+    time.sleep(1.5)
+    assert eyes.pan.value is None and eyes.tilt.value is None  # released
+    assert abs(eyes.pos[0]) < 0.02 and abs(eyes.pos[1]) < 0.02  # back at centre
+    eyes.stop.set()
+    worker.join(2)
+
+
+def test_disabled_eyes_do_nothing():
+    eyes = tp.Eyes(tp.load_eye_config("/nonexistent.ini"), enabled=True)
+    assert not eyes.active
+    eyes.run()  # returns at once
+
+
+def test_eye_reverse_flips_direction():
+    eyes = make_eyes(pan_reverse=True)
+    eyes.pos = [0.5, 0.3]
+    eyes.write()
+    assert eyes.pan.value == -0.5 and eyes.tilt.value == 0.3
+
+
+def test_eye_test_single_servo(monkeypatch):
+    monkeypatch.setattr(tp.time, "sleep", lambda s: None)
+    eyes = make_eyes()
+    tp.eye_test(eyes, "pan")
+    assert any(v not in (None, 0) for v in eyes.pan.history)
+    assert all(v is None for v in eyes.tilt.history)  # tilt never driven
+    assert tp.parse_args(["--eye-test"]).eye_test == "both"
+    assert tp.parse_args(["--eye-test", "tilt"]).eye_test == "tilt"

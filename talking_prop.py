@@ -21,6 +21,7 @@ import html
 import json
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -66,6 +67,52 @@ def load_chatterpi_config(path):
         "jaw_pin": int(get("PINS", "jaw_pin", 18)),
         "eyes_pin": int(get("PINS", "eyes_pin", 25)),
     }
+
+
+def load_eye_config(path):
+    """Settings for an optional servo-driven eye from the [EYE_SERVOS] section."""
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    sec = cfg["EYE_SERVOS"] if cfg.has_section("EYE_SERVOS") else {}
+
+    def num(key, default, kind=int):
+        try:
+            return kind(sec.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": str(sec.get("enabled", "OFF")).upper() == "ON",
+        "pan_pin": num("pan_pin", 12),
+        "pan_min": num("pan_min", 1000),
+        "pan_max": num("pan_max", 2000),
+        "pan_range": min(1.0, max(0.0, num("pan_range", 0.8, float))),
+        "pan_reverse": str(sec.get("pan_reverse", "OFF")).upper() == "ON",
+        "tilt_pin": num("tilt_pin", 13),
+        "tilt_min": num("tilt_min", 1000),
+        "tilt_max": num("tilt_max", 2000),
+        "tilt_range": min(1.0, max(0.0, num("tilt_range", 0.5, float))),
+        "tilt_reverse": str(sec.get("tilt_reverse", "OFF")).upper() == "ON",
+        "min_hold": num("min_hold", 0.4, float),
+        "max_hold": num("max_hold", 1.6, float),
+    }
+
+
+_PIN_FACTORY = []
+
+
+def pin_factory():
+    """pigpio for hardware-timed servo pulses if its daemon is running, else gpiozero's default."""
+    if not _PIN_FACTORY:
+        try:
+            from gpiozero.pins.pigpio import PiGPIOFactory
+
+            _PIN_FACTORY.append(PiGPIOFactory())
+        except Exception as exc:  # pigpiod not running or not installed
+            print("pigpio unavailable (%s); using gpiozero's default pins. "
+                  "Expect some servo jitter; see the pigpio section of the README." % exc)
+            _PIN_FACTORY.append(None)
+    return _PIN_FACTORY[0]
 
 
 # --------------------------------------------------------------------------
@@ -184,14 +231,7 @@ class Jaw:
             return
         from gpiozero import AngularServo, DigitalOutputDevice
 
-        factory = None
-        try:
-            from gpiozero.pins.pigpio import PiGPIOFactory
-
-            factory = PiGPIOFactory()  # hardware-timed pulses: no servo jitter
-        except Exception as exc:  # pigpiod not running or not installed
-            print("pigpio unavailable (%s); using gpiozero's default pins. "
-                  "Expect some servo jitter; see the pigpio section of the README." % exc)
+        factory = pin_factory()
         self.servo = AngularServo(
             settings["jaw_pin"],
             min_angle=settings["min_angle"],
@@ -204,11 +244,16 @@ class Jaw:
         if settings["eyes"]:
             self.eyes = DigitalOutputDevice(settings["eyes_pin"], pin_factory=factory)
 
+    @staticmethod
+    def volume(samples):
+        """Average loudness of a chunk, on the same scale as ChatterPi's levels."""
+        return int(np.abs(samples.astype(np.int32)).mean()) if len(samples) else 0
+
     def target(self, samples):
         """Return the jaw angle for one chunk of int16 samples."""
         if len(samples) == 0:
             return self.closed
-        volume = int(np.abs(samples.astype(np.int32)).mean())
+        volume = self.volume(samples)
         s = self.s
         if s["style"] == 0:  # single threshold: open or shut
             return self.open if volume > s["threshold"] else self.closed
@@ -242,6 +287,137 @@ class Jaw:
 
 
 # --------------------------------------------------------------------------
+# Eye
+# --------------------------------------------------------------------------
+class Eyes:
+    """One eye on two servos (pan = side to side, tilt = up and down).
+
+    While the prop talks, the eye glances to random spots, holding each for a moment;
+    when it stops, the eye returns to centre and the servos are released so they don't buzz.
+    Positions run from -1 (one end of the servo's travel) to +1 (the other), 0 is centre.
+    """
+
+    STEP = 0.03     # seconds between servo updates
+    EASE = 0.35     # fraction of the remaining distance covered each update
+
+    def __init__(self, settings, enabled=True, rng=None):
+        self.s = settings
+        self.rng = rng or random.Random()
+        self.pan = self.tilt = None
+        self.talking = threading.Event()
+        self.stop = threading.Event()
+        self.pos = [0.0, 0.0]
+        self.target = [0.0, 0.0]
+        self.drive = {"pan": True, "tilt": True}  # which servos get pulses (eye test can pick one)
+        self.active = enabled and settings["enabled"]
+        if not self.active:
+            return
+        from gpiozero import Servo
+
+        factory = pin_factory()
+        def servo(axis):
+            low, high = sorted((settings[axis + "_min"], settings[axis + "_max"]))
+            return Servo(settings[axis + "_pin"], initial_value=0, min_pulse_width=low / 1e6,
+                         max_pulse_width=high / 1e6, pin_factory=factory)
+
+        self.pan, self.tilt = servo("pan"), servo("tilt")
+        self.release()
+
+    def new_target(self):
+        """A random spot within the allowed range, never too close to the last one."""
+        while True:
+            target = [self.rng.uniform(-1, 1) * self.s["pan_range"],
+                      self.rng.uniform(-1, 1) * self.s["tilt_range"]]
+            if abs(target[0] - self.target[0]) + abs(target[1] - self.target[1]) > 0.25 \
+                    or self.s["pan_range"] + self.s["tilt_range"] < 0.25:
+                return target
+
+    def write(self):
+        if self.pan is not None:
+            pan = -self.pos[0] if self.s["pan_reverse"] else self.pos[0]
+            tilt = -self.pos[1] if self.s["tilt_reverse"] else self.pos[1]
+            if self.drive["pan"]:
+                self.pan.value = max(-1.0, min(1.0, pan))
+            if self.drive["tilt"]:
+                self.tilt.value = max(-1.0, min(1.0, tilt))
+
+    def release(self):
+        if self.pan is not None:
+            self.pan.value = None
+            self.tilt.value = None
+
+    def step_towards_target(self):
+        moved = False
+        for axis in (0, 1):
+            gap = self.target[axis] - self.pos[axis]
+            if abs(gap) > 0.01:
+                self.pos[axis] += gap * self.EASE
+                moved = True
+            else:
+                self.pos[axis] = self.target[axis]
+        if moved:
+            self.write()
+        return moved
+
+    def run(self):
+        """Background loop: glance around while talking, centre and relax when not."""
+        if not self.active:
+            return
+        next_glance = 0.0
+        centred = True
+        idle_since = time.monotonic()
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if self.talking.is_set():
+                centred = False
+                if now >= next_glance:
+                    self.target = self.new_target()
+                    next_glance = now + self.rng.uniform(self.s["min_hold"], self.s["max_hold"])
+                self.step_towards_target()
+                idle_since = now
+            elif not centred:
+                self.target = [0.0, 0.0]
+                if not self.step_towards_target() and now - idle_since > 0.5:
+                    self.release()
+                    centred = True
+            time.sleep(self.STEP)
+        self.target = [0.0, 0.0]
+        self.pos = [0.0, 0.0]
+        self.write()
+        time.sleep(0.2)
+        self.release()
+
+    def set_talking(self, on):
+        (self.talking.set if on else self.talking.clear)()
+
+
+EYE_TEST_MOVES = {
+    "pan": ((-1, 0), (1, 0), (-1, 0), (1, 0), (0, 0)),
+    "tilt": ((0, -1), (0, 1), (0, -1), (0, 1), (0, 0)),
+    "both": ((-1, 0), (1, 0), (0, 0), (0, 1), (0, -1), (0, 0),
+             (-1, -1), (1, -1), (1, 1), (-1, 1), (0, 0)),
+}
+
+
+def eye_test(eyes, which="both"):
+    """Move one or both eye servos to the ends of their range and back, then centre."""
+    if not eyes.active:
+        raise SystemExit("Eye servos are off. Set enabled = ON in the [EYE_SERVOS] section of config.ini.")
+    s = eyes.s
+    eyes.drive = {"pan": which in ("pan", "both"), "tilt": which in ("tilt", "both")}
+    eyes.release()
+    print("Testing %s: pin %s" % (which, ", ".join(
+        "%s GPIO %d" % (axis, s[axis + "_pin"]) for axis in ("pan", "tilt") if eyes.drive[axis])))
+    for pan, tilt in EYE_TEST_MOVES[which]:
+        eyes.target = [pan * s["pan_range"], tilt * s["tilt_range"]]
+        for _ in range(25):
+            eyes.step_towards_target()
+            time.sleep(eyes.STEP)
+        time.sleep(0.3)
+    eyes.release()
+
+
+# --------------------------------------------------------------------------
 # Sample-rate helpers (whole-number ratios only; cheap enough for a Pi 3)
 # --------------------------------------------------------------------------
 def rate_factor(device_rate):
@@ -266,9 +442,10 @@ def upsample(samples, factor):
 # The conversation
 # --------------------------------------------------------------------------
 class TalkingProp:
-    def __init__(self, args, jaw):
+    def __init__(self, args, jaw, eyes=None):
         self.args = args
         self.jaw = jaw
+        self.eyes = eyes
         self.mic_factor = rate_factor(args.mic_rate)
         self.out_factor = rate_factor(args.out_rate)
         self.mic_queue = queue.Queue(maxsize=50)
@@ -283,6 +460,7 @@ class TalkingProp:
         self.response_idle.set()
         self.send_lock = threading.Lock()
         self.last_user_text = ""
+        self.reply_volumes = []    # loudness of each 20 ms of the current reply (--debug)
         self.called_tool = False   # the current response called a tool
         self.promised = False      # the current response said it would look something up
 
@@ -303,6 +481,8 @@ class TalkingProp:
         if len(samples):
             self.last_audio_time = time.monotonic()
             self.jaw.move(self.jaw.target(samples))
+            if self.args.debug:
+                self.reply_volumes.append(self.jaw.volume(samples))
         if len(chunk) < want:
             samples = np.concatenate([samples, np.zeros((want - len(chunk)) // 2, dtype=np.int16)])
         return (upsample(samples, self.out_factor).tobytes(), 0)
@@ -527,8 +707,19 @@ class TalkingProp:
             talking = self.prop_is_talking()
             if talking and not self.is_speaking:
                 self.jaw.speaking(True)
+                if self.eyes is not None:
+                    self.eyes.set_talking(True)
             elif not talking and self.is_speaking:
+                if self.args.debug and self.reply_volumes:
+                    vols = sorted(self.reply_volumes)
+                    s = self.jaw.s
+                    print("jaw: reply loudness median %d, loud parts %d, peak %d  (levels %d / %d / %d)" % (
+                        vols[len(vols) // 2], vols[int(len(vols) * 0.9)], vols[-1],
+                        s["level1"], s["level2"], s["level3"]))
+                    self.reply_volumes = []
                 self.jaw.speaking(False)
+                if self.eyes is not None:
+                    self.eyes.set_talking(False)
                 self.jaw.rest()
             self.is_speaking = talking
             time.sleep(0.05)
@@ -545,8 +736,10 @@ class TalkingProp:
         speaker = pa.open(format=pyaudio.paInt16, channels=1, rate=self.args.out_rate, output=True,
                           output_device_index=out_index,
                           frames_per_buffer=int(self.args.out_rate * 0.02), stream_callback=self.on_speaker)
-        threads = [threading.Thread(target=fn, daemon=True)
-                   for fn in (self.run_socket, self.send_mic, self.watch_speaking, self.refresh_clock)]
+        workers = [self.run_socket, self.send_mic, self.watch_speaking, self.refresh_clock]
+        if self.eyes is not None:
+            workers.append(self.eyes.run)
+        threads = [threading.Thread(target=fn, daemon=True) for fn in workers]
         for thread in threads:
             thread.start()
         print("Listening. Ctrl-C to quit.")
@@ -565,6 +758,9 @@ class TalkingProp:
             speaker.close()
             pa.terminate()
             self.jaw.rest()
+            if self.eyes is not None:
+                self.eyes.stop.set()
+                time.sleep(0.5)
 
 
 def find_device(pa, wanted, need_input):
@@ -631,6 +827,9 @@ def parse_args(argv=None):
     p.add_argument("--no-servo", action="store_true", help="run without touching GPIO")
     p.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     p.add_argument("--jaw-test", action="store_true", help="step the jaw through its positions and exit")
+    p.add_argument("--eye-test", nargs="?", const="both", choices=("pan", "tilt", "both"),
+                   help="move the eye servos through their range and exit; "
+                        "add pan or tilt to test just one (default both)")
     p.add_argument("--brave-key-file", default=os.path.join(HERE, "brave_key.txt"),
                    help="file holding the Brave Search API key (or set BRAVE_API_KEY)")
     p.add_argument("--no-search", action="store_true", help="turn web search off even if a key is present")
@@ -657,9 +856,12 @@ def main():
     jaw = Jaw(load_chatterpi_config(args.config), enabled=not args.no_servo)
     if args.jaw_test:
         return jaw_test(jaw)
+    eyes = Eyes(load_eye_config(args.config), enabled=not args.no_servo)
+    if args.eye_test:
+        return eye_test(eyes, args.eye_test)
     if not args.url:
         raise SystemExit("No server URL. Pass --url ws://<server>:8765/v1/realtime or set TALKING_PROP_URL.")
-    TalkingProp(args, jaw).run()
+    TalkingProp(args, jaw, eyes if eyes.active else None).run()
 
 
 if __name__ == "__main__":

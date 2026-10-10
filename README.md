@@ -19,6 +19,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - [Server setup](#server-setup)
 - [Install on the Pi](#install-on-the-pi)
 - [Run it](#run-it)
+- [Moving eye](#moving-eye)
 - [Personality](#personality)
 - [Web search](#web-search)
 - [Voices](#voices)
@@ -35,6 +36,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - **Personality from a text file.** `persona.txt` sets who the prop is and how it talks.
 - **Optional web search** through the [Brave Search API](https://brave.com/search/api/), with SafeSearch set to strict.
 - **Self-muting.** The mic is muted while the prop speaks so it doesn't answer itself.
+- **Optional moving eye** on two servos (side to side and up and down) that glances around while the prop talks.
 - **Optional LED eyes** that light while the prop talks.
 - **Reconnects on its own** if the server or network drops.
 
@@ -60,6 +62,8 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 | Jaw servo power | External 5 V | Don't power the servo from the Pi's 5 V pin; it browns out the Pi. |
 | Servo ground | Any GND | Must be shared between the servo supply and the Pi. |
 | LED eyes (optional) | GPIO 25 | Through a resistor. Set `eyes = ON` and `eyes_pin` in `config.ini`. |
+| Eye pan servo (optional) | GPIO 12 | Side to side. Set in `[EYE_SERVOS]`; see [Moving eye](#moving-eye). |
+| Eye tilt servo (optional) | GPIO 13 | Up and down. |
 
 ## Server setup
 
@@ -247,6 +251,7 @@ You'll see `Connected to ...`, then `You:` and `Prop:` lines as the conversation
 | `--no-search` | Turn web search off even if a key is present. |
 | `--no-servo` | Run without touching GPIO, e.g. on a desktop. |
 | `--list-devices` | Print audio devices and exit. |
+| `--eye-test [pan\|tilt]` | Move the eye servos through their range and exit. Add `pan` or `tilt` to move just that one. |
 | `--jaw-test` | Step the jaw through its positions and exit. |
 | `--debug` | Print every event the server sends, plus a mic level meter once a second. |
 
@@ -269,6 +274,29 @@ Day to day:
 | Stop it (before running the script by hand) | `sudo systemctl stop talking-prop` |
 
 The service and a hand-run copy can't share the mic and servo, so stop one before starting the other.
+
+## Moving eye
+
+An eye on two servos, one for side to side (pan) and one for up and down (tilt), glances to random spots while the prop talks and returns to centre when it stops. Each servo needs its own GPIO pin: a Y-cable would send both the same signal, so the eye could only move diagonally.
+
+Power both servos from the same external 5 V supply as the jaw, with grounds shared with the Pi. Then add to `config.ini` (the full set of keys, with comments, is in `config.example.ini`):
+
+```ini
+[EYE_SERVOS]
+enabled = ON
+pan_pin = 12
+tilt_pin = 13
+pan_range = 0.8
+tilt_range = 0.5
+```
+
+Check the movement and limits:
+
+```bash
+python3 talking_prop.py --eye-test
+```
+
+It looks left, right, up, down, then around the corners, and centres. To test one servo on its own, use `--eye-test pan` or `--eye-test tilt`; the other servo gets no signal. If a direction is reversed, set `pan_reverse = ON` or `tilt_reverse = ON`. If the eye hits the edge of the socket, lower `pan_range` or `tilt_range`, or narrow the pulse widths. `min_hold` and `max_hold` set how long it holds each glance.
 
 ## Personality
 
@@ -356,6 +384,7 @@ To switch between voices, keep the other pair commented out in the compose file 
 - **Listening.** Mic audio streams continuously as `input_audio_buffer.append`. While the prop is talking (plus `--tail` seconds), silence is sent instead, unless `--barge-in` is on.
 - **Speaking.** Reply audio arrives as `response.output_audio.delta` chunks and is queued for playback. Every 20 ms of playback, the average loudness of that chunk picks one of four jaw positions (or two with `style = 0`), so the jaw tracks what is actually coming out of the speaker.
 - **Searching.** When the model calls `web_search`, the Pi queries Brave, waits for the current response to finish, returns the results as a `function_call_output`, and asks the model to continue.
+- **Eye.** While the prop talks, the eye eases towards a random spot every half-second to second and a half; afterwards it centres and its servos are released too.
 - **Resting.** After speaking, the jaw closes and the servo pulses stop so it doesn't buzz.
 
 ## Tests
