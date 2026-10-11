@@ -98,6 +98,38 @@ def load_eye_config(path):
     }
 
 
+def load_song_config(path):
+    """Settings for song mode from the [SONG] section (off unless a file is set)."""
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    sec = cfg["SONG"] if cfg.has_section("SONG") else {}
+    base = os.path.dirname(os.path.abspath(path))
+    song_file = str(sec.get("file", "")).strip()
+    if song_file and not os.path.isabs(song_file):
+        song_file = os.path.join(base, song_file)
+    triggers = [t.strip().lower() for t in str(sec.get("triggers", "")).split(",") if t.strip()]
+    try:
+        button_pin = int(sec.get("button_pin", 0) or 0)
+    except ValueError:
+        button_pin = 0
+    return {
+        "file": song_file,
+        "triggers": triggers,
+        "button_pin": button_pin,
+        "button_active_high": str(sec.get("button_active_high", "ON")).upper() == "ON",
+        # ChatterPi drives the jaw from the right channel, so that's the default here too.
+        "jaw_channel": "left" if str(sec.get("jaw_channel", "right")).lower() == "left" else "right",
+        "output": "stereo" if str(sec.get("output", "mix")).lower() == "stereo" else "mix",
+        "after": str(sec.get("after_song", "")).strip(),
+    }
+
+
+def heard_trigger(transcript, triggers):
+    """True if the visitor said one of the trigger phrases (ignoring case and punctuation)."""
+    words = " ".join(re.sub(r"[^a-z0-9' ]+", " ", (transcript or "").lower()).split())
+    return any(" ".join(t.split()) in words for t in triggers if t)
+
+
 _PIN_FACTORY = []
 
 
@@ -442,10 +474,19 @@ def upsample(samples, factor):
 # The conversation
 # --------------------------------------------------------------------------
 class TalkingProp:
-    def __init__(self, args, jaw, eyes=None):
+    def __init__(self, args, jaw, eyes=None, song=None):
         self.args = args
         self.jaw = jaw
         self.eyes = eyes
+        self.song = song if song and song.get("file") else None
+        self.song_active = threading.Event()  # the song is playing
+        self.song_stop = threading.Event()    # stop the song early
+        self.song_requested = 0.0             # when a song was asked for (0 = not asked)
+        self.song_intro_done = False          # the prop has finished its spoken intro
+        self.pyaudio = None
+        self.pa = None
+        self.out_index = None
+        self.speaker = None
         self.mic_factor = rate_factor(args.mic_rate)
         self.out_factor = rate_factor(args.out_rate)
         self.mic_queue = queue.Queue(maxsize=50)
@@ -488,7 +529,9 @@ class TalkingProp:
         return (upsample(samples, self.out_factor).tobytes(), 0)
 
     def prop_is_talking(self):
-        """True while reply audio is playing, plus a short tail for room echo."""
+        """True while reply audio or the song is playing, plus a short tail for room echo."""
+        if self.song_active.is_set():
+            return True
         with self.play_lock:
             pending = len(self.play_buffer) > 0
         return pending or (time.monotonic() - self.last_audio_time) < self.args.tail
@@ -509,6 +552,10 @@ class TalkingProp:
         now = current_time()
         instructions += ("\n\nRight now it is %s on %s (%s). When asked the time or date, give exactly "
                          "this, in your own words; never guess it." % (now["time"], now["date"], now["timezone"]))
+        if self.song and self.song["triggers"]:
+            instructions += ("\n\nYou have a song you love to perform. If someone asks you to sing, never "
+                             "refuse: reply with one short, eager line to introduce it, and the song "
+                             "will start right after you speak.")
         return {
             "type": "session.update",
             "session": {
@@ -591,6 +638,8 @@ class TalkingProp:
             return
         kind = event.get("type", "")
         if kind in ("response.output_audio.delta", "response.audio.delta"):
+            if self.song_active.is_set():
+                return  # never talk over the song
             pcm = base64.b64decode(event.get("delta", ""))
             with self.play_lock:
                 self.play_buffer.extend(pcm)
@@ -601,6 +650,12 @@ class TalkingProp:
         elif kind == "conversation.item.input_audio_transcription.completed":
             self.last_user_text = (event.get("transcript") or "").strip()
             print("You:   %s" % self.last_user_text)
+            if (self.song and not self.song_active.is_set() and not self.song_requested
+                    and heard_trigger(self.last_user_text, self.song["triggers"])):
+                print("Song requested; it starts after the intro.")
+                self.song_requested = time.monotonic()
+                self.song_intro_done = False
+                self.last_user_text = ""  # no search fallback for this one
         elif kind in ("response.output_audio_transcript.done", "response.audio_transcript.done"):
             reply = (event.get("transcript") or "").strip()
             print("Prop:  %s" % reply)
@@ -610,6 +665,8 @@ class TalkingProp:
             self.called_tool = self.promised = False
         elif kind == "response.done":
             self.response_idle.set()
+            if self.song_requested:
+                self.song_intro_done = True
             if (self.promised and not self.called_tool and self.args.brave_key
                     and self.args.search_fallback and self.last_user_text):
                 query, self.last_user_text = self.last_user_text, ""
@@ -672,7 +729,7 @@ class TalkingProp:
                     peak, sent, last_report = 0, 0, time.monotonic()
             if not self.connected.is_set():
                 continue
-            muted = not self.args.barge_in and self.prop_is_talking()
+            muted = self.song_active.is_set() or (not self.args.barge_in and self.prop_is_talking())
             if muted:
                 samples = np.zeros_like(samples)
             message = {"type": "input_audio_buffer.append",
@@ -701,9 +758,121 @@ class TalkingProp:
             except Exception:
                 pass
 
+    def request_song_now(self):
+        """Button press: start the song right away, or stop it if it's playing."""
+        if self.song_active.is_set():
+            print("Song stopped by button.")
+            self.song_stop.set()
+        elif self.song:
+            print("Song started by button.")
+            with self.play_lock:
+                del self.play_buffer[:]  # cut off anything the prop was saying
+            self.song_requested = time.monotonic()
+            self.song_intro_done = True
+
+    def song_ready(self):
+        """A requested song can start once the spoken intro is over (or after 8 s regardless)."""
+        if not self.song_requested or self.song_active.is_set():
+            return False
+        waited = time.monotonic() - self.song_requested
+        with self.play_lock:
+            still_speaking = len(self.play_buffer) > 0
+        return not still_speaking and ((self.song_intro_done and self.response_idle.is_set()) or waited > 8)
+
+    def open_speaker(self):
+        pyaudio = self.pyaudio
+        self.speaker = self.pa.open(format=pyaudio.paInt16, channels=1, rate=self.args.out_rate, output=True,
+                                    output_device_index=self.out_index,
+                                    frames_per_buffer=int(self.args.out_rate * 0.02),
+                                    stream_callback=self.on_speaker)
+
+    def play_song(self):
+        """Play the song WAV like ChatterPi: one channel drives the jaw, the speaker gets the music."""
+        import wave
+
+        pyaudio = self.pyaudio
+        song = self.song
+        self.song_requested = 0.0
+        try:
+            wav = wave.open(song["file"], "rb")
+        except (OSError, wave.Error) as exc:
+            print("Can't play the song: %s" % exc)
+            self.song_active.clear()
+            return
+        if wav.getsampwidth() != 2:
+            print("Can't play the song: it must be 16-bit PCM WAV. Convert it with: "
+                  "ffmpeg -i in.wav -c:a pcm_s16le -ar 44100 song.wav")
+            wav.close()
+            self.song_active.clear()
+            return
+        channels, rate = wav.getnchannels(), wav.getframerate()
+        jaw_index = 1 if (channels == 2 and song["jaw_channel"] == "right") else 0
+        out_channels = channels
+        print("Song: %s (%d ch, %d Hz, %.0f s)" % (os.path.basename(song["file"]), channels, rate,
+                                                  wav.getnframes() / float(rate)))
+        self.song_stop.clear()
+        self.song_active.set()
+        with self.play_lock:
+            del self.play_buffer[:]
+        if self.speaker is not None:  # the sound card can only be opened once: swap streams
+            self.speaker.stop_stream()
+            self.speaker.close()
+            self.speaker = None
+        finished = threading.Event()
+
+        def callback(in_data, frame_count, time_info, status):
+            data = wav.readframes(frame_count)
+            frames = np.frombuffer(data, dtype=np.int16).reshape(-1, channels)
+            if len(frames) == 0 or self.song_stop.is_set():
+                finished.set()
+                return (b"\x00" * frame_count * out_channels * 2, pyaudio.paComplete)
+            self.jaw.move(self.jaw.target(frames[:, jaw_index]))
+            if channels == 2 and song["output"] == "mix":  # one speaker: hear voice and music together
+                mono = (frames.astype(np.int32).sum(axis=1) // 2).astype(np.int16)
+                frames = np.repeat(mono[:, None], 2, axis=1)
+            out = frames.tobytes()
+            if len(frames) < frame_count:
+                out += b"\x00" * (frame_count - len(frames)) * out_channels * 2
+                finished.set()
+                return (out, pyaudio.paComplete)
+            return (out, pyaudio.paContinue)
+
+        stream = None
+        try:
+            stream = self.pa.open(format=pyaudio.paInt16, channels=out_channels, rate=rate, output=True,
+                                  output_device_index=self.out_index, frames_per_buffer=int(rate * 0.02),
+                                  stream_callback=callback)
+            while not finished.is_set() and not self.stop.is_set():
+                finished.wait(0.2)
+            time.sleep(0.2)
+        except Exception as exc:
+            print("Song playback problem: %s" % exc)
+        finally:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+            wav.close()
+            if not self.stop.is_set() and self.speaker is None and self.args.url:
+                self.open_speaker()
+            self.last_audio_time = time.monotonic()
+            self.song_active.clear()
+            print("Song finished; back to conversation.")
+        if song["after"] and self.connected.is_set() and not self.stop.is_set():
+            try:
+                self.send({"type": "conversation.item.create",
+                           "item": {"type": "message", "role": "user",
+                                    "content": [{"type": "input_text", "text": song["after"]}]}})
+                self.send({"type": "response.create"})
+            except Exception:
+                pass
+
     def watch_speaking(self):
         """Light the eyes (if wired) while talking and relax the servo afterwards."""
         while not self.stop.is_set():
+            if self.song and self.song_ready():
+                self.song_requested = 0.0
+                self.song_active.set()  # claim it now so it can't start twice
+                threading.Thread(target=self.play_song, daemon=True).start()
             talking = self.prop_is_talking()
             if talking and not self.is_speaking:
                 self.jaw.speaking(True)
@@ -724,18 +893,37 @@ class TalkingProp:
             self.is_speaking = talking
             time.sleep(0.05)
 
-    def run(self):
+    def start_audio(self):
         import pyaudio
 
-        pa = pyaudio.PyAudio()
+        self.pyaudio = pyaudio
+        self.pa = pyaudio.PyAudio()
+        self.out_index = find_device(self.pa, self.args.out_device, need_input=False)
+
+    def start_button(self):
+        """Song button on a GPIO: press to start the song, press again to stop it."""
+        if not self.song or not self.song["button_pin"] or self.args.no_servo:
+            return None
+        from gpiozero import Button
+
+        button = Button(self.song["button_pin"], pull_up=not self.song["button_active_high"],
+                        bounce_time=0.1, pin_factory=pin_factory())
+        button.when_pressed = self.request_song_now
+        print("Song button on GPIO %d" % self.song["button_pin"])
+        return button
+
+    def run(self):
+        self.start_audio()
+        pyaudio, pa = self.pyaudio, self.pa
         mic_index = find_device(pa, self.args.mic_device, need_input=True)
-        out_index = find_device(pa, self.args.out_device, need_input=False)
         mic = pa.open(format=pyaudio.paInt16, channels=1, rate=self.args.mic_rate, input=True,
                       input_device_index=mic_index,
                       frames_per_buffer=int(self.args.mic_rate * 0.04), stream_callback=self.on_mic)
-        speaker = pa.open(format=pyaudio.paInt16, channels=1, rate=self.args.out_rate, output=True,
-                          output_device_index=out_index,
-                          frames_per_buffer=int(self.args.out_rate * 0.02), stream_callback=self.on_speaker)
+        self.open_speaker()
+        button = self.start_button()  # noqa: F841 (kept alive for its callback)
+        if self.song:
+            print("Song ready: %s%s" % (os.path.basename(self.song["file"]),
+                                        ", say: " + " / ".join(self.song["triggers"]) if self.song["triggers"] else ""))
         workers = [self.run_socket, self.send_mic, self.watch_speaking, self.refresh_clock]
         if self.eyes is not None:
             workers.append(self.eyes.run)
@@ -752,10 +940,13 @@ class TalkingProp:
             self.stop.set()
             if self.ws is not None:
                 self.ws.close()
+            self.song_stop.set()
             mic.stop_stream()
-            speaker.stop_stream()
             mic.close()
-            speaker.close()
+            if self.speaker is not None:
+                self.speaker.stop_stream()
+                self.speaker.close()
+            time.sleep(0.3)
             pa.terminate()
             self.jaw.rest()
             if self.eyes is not None:
@@ -827,6 +1018,8 @@ def parse_args(argv=None):
     p.add_argument("--no-servo", action="store_true", help="run without touching GPIO")
     p.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     p.add_argument("--jaw-test", action="store_true", help="step the jaw through its positions and exit")
+    p.add_argument("--sing", action="store_true",
+                   help="play the [SONG] file once with the jaw and eye moving, then exit (no server needed)")
     p.add_argument("--eye-test", nargs="?", const="both", choices=("pan", "tilt", "both"),
                    help="move the eye servos through their range and exit; "
                         "add pan or tilt to test just one (default both)")
@@ -859,9 +1052,36 @@ def main():
     eyes = Eyes(load_eye_config(args.config), enabled=not args.no_servo)
     if args.eye_test:
         return eye_test(eyes, args.eye_test)
+    song = load_song_config(args.config)
+    if song["file"] and not os.path.isfile(song["file"]):
+        print("Song file not found: %s (song mode off)" % song["file"])
+        song = None
+    if args.sing:
+        if not song or not song["file"]:
+            raise SystemExit("No song. Set file = ... in the [SONG] section of config.ini.")
+        return sing_once(args, jaw, eyes if eyes.active else None, song)
     if not args.url:
         raise SystemExit("No server URL. Pass --url ws://<server>:8765/v1/realtime or set TALKING_PROP_URL.")
-    TalkingProp(args, jaw, eyes if eyes.active else None).run()
+    TalkingProp(args, jaw, eyes if eyes.active else None, song).run()
+
+
+def sing_once(args, jaw, eyes, song):
+    """--sing: perform the song without a server, to check levels, channels and movement."""
+    prop = TalkingProp(args, jaw, eyes, song)
+    prop.start_audio()
+    workers = [prop.watch_speaking] + ([eyes.run] if eyes is not None else [])
+    for fn in workers:
+        threading.Thread(target=fn, daemon=True).start()
+    button = prop.start_button()  # noqa: F841 (press to stop early)
+    try:
+        prop.play_song()
+    except KeyboardInterrupt:
+        prop.song_stop.set()
+    finally:
+        prop.stop.set()
+        jaw.rest()
+        time.sleep(0.5)
+        prop.pa.terminate()
 
 
 if __name__ == "__main__":

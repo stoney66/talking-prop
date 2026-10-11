@@ -20,6 +20,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - [Install on the Pi](#install-on-the-pi)
 - [Run it](#run-it)
 - [Moving eye](#moving-eye)
+- [Song mode](#song-mode)
 - [Personality](#personality)
 - [Web search](#web-search)
 - [Voices](#voices)
@@ -38,6 +39,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - **Self-muting.** The mic is muted while the prop speaks so it doesn't answer itself.
 - **Optional moving eye** on two servos (side to side and up and down) that glances around while the prop talks.
 - **Optional LED eyes** that light while the prop talks.
+- **Song mode.** A trigger phrase or a button makes the prop perform a song from a WAV file, ChatterPi-style, then return to conversation.
 - **Reconnects on its own** if the server or network drops.
 
 ## What you need
@@ -251,6 +253,7 @@ You'll see `Connected to ...`, then `You:` and `Prop:` lines as the conversation
 | `--no-search` | Turn web search off even if a key is present. |
 | `--no-servo` | Run without touching GPIO, e.g. on a desktop. |
 | `--list-devices` | Print audio devices and exit. |
+| `--sing` | Play the song once with jaw and eye, then exit. No server needed. |
 | `--eye-test [pan\|tilt]` | Move the eye servos through their range and exit. Add `pan` or `tilt` to move just that one. |
 | `--jaw-test` | Step the jaw through its positions and exit. |
 | `--debug` | Print every event the server sends, plus a mic level meter once a second. |
@@ -297,6 +300,44 @@ python3 talking_prop.py --eye-test
 ```
 
 It looks left, right, up, down, then around the corners, and centres. To test one servo on its own, use `--eye-test pan` or `--eye-test tilt`; the other servo gets no signal. If a direction is reversed, set `pan_reverse = ON` or `tilt_reverse = ON`. If the eye hits the edge of the socket, lower `pan_range` or `tilt_range`, or narrow the pulse widths. `min_hold` and `max_hold` set how long it holds each glance.
+
+## Song mode
+
+The prop can stop talking, perform a song, and go back to conversation afterwards. The song is a WAV file in ChatterPi's format: the right channel carries the vocals that drive the jaw, the left can carry backing music that doesn't move it. You can play along live.
+
+Set it up in `config.ini` (all keys, with comments, are in `config.example.ini`):
+
+```ini
+[SONG]
+file = song.wav
+triggers = sing us a song, sing me a song
+button_pin = 23
+jaw_channel = right
+output = mix
+after_song = [The song just ended. Say one short, proud line about your performance.]
+```
+
+Two ways to start it:
+
+- **Say a trigger phrase.** The prop answers with a short intro ("Here be me finest shanty!"), then the song starts as soon as it finishes speaking. The script tells the model about the song automatically, so it won't refuse.
+- **Press the button** on `button_pin`. The song starts immediately, cutting off anything the prop was saying; press again to stop it early. A foot switch works well if you're playing along.
+
+During the song the mic is muted so the server doesn't hear the music, the eye glances around as when talking, and nothing the server sends is played. Afterwards the prop goes back to conversation, optionally saying the `after_song` line.
+
+Details:
+
+- **Format:** 16-bit PCM WAV, mono or stereo, any sample rate. Convert with `ffmpeg -i in.mp3 -c:a pcm_s16le -ar 44100 song.wav`.
+- **`jaw_channel`:** the channel with the vocals. Defaults to `right`, the same as ChatterPi, so existing ChatterPi files work unchanged. Set `left` if your vocals are on the other side.
+- **`output`:** `mix` plays both channels on every speaker (right for one speaker), `stereo` keeps them separate.
+- **Button wiring:** `button_active_high = ON` (default) is for a switch to 3.3 V or a sensor that outputs high, matching ChatterPi's trigger input; use `OFF` for a switch to ground. Don't use a motion sensor here, or the song restarts every time someone walks past.
+
+Rehearse without the server:
+
+```bash
+python3 talking_prop.py --sing
+```
+
+It plays the song once with the jaw and eye moving, then exits. Ctrl-C or the button stops it. If the jaw barely moves or never closes during the song, tune the jaw levels as described in [Run it](#run-it), or check `jaw_channel`.
 
 ## Personality
 
@@ -385,6 +426,7 @@ To switch between voices, keep the other pair commented out in the compose file 
 - **Speaking.** Reply audio arrives as `response.output_audio.delta` chunks and is queued for playback. Every 20 ms of playback, the average loudness of that chunk picks one of four jaw positions (or two with `style = 0`), so the jaw tracks what is actually coming out of the speaker.
 - **Searching.** When the model calls `web_search`, the Pi queries Brave, waits for the current response to finish, returns the results as a `function_call_output`, and asks the model to continue.
 - **Eye.** While the prop talks, the eye eases towards a random spot every half-second to second and a half; afterwards it centres and its servos are released too.
+- **Song.** On a trigger phrase (after the spoken intro) or a button press, the conversation audio stream is closed and the WAV plays through its own stream at its native rate; every 20 ms of the vocal channel sets the jaw. Afterwards the conversation stream reopens.
 - **Resting.** After speaking, the jaw closes and the servo pulses stop so it doesn't buzz.
 
 ## Tests

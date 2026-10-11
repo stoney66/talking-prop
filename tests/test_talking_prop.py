@@ -447,3 +447,147 @@ def test_eye_test_single_servo(monkeypatch):
     assert all(v is None for v in eyes.tilt.history)  # tilt never driven
     assert tp.parse_args(["--eye-test"]).eye_test == "both"
     assert tp.parse_args(["--eye-test", "tilt"]).eye_test == "tilt"
+
+
+# ---------------------------------------------------------------- song mode
+import types
+import wave
+
+
+def write_wav(path, left, right=None, rate=8000):
+    frames = left if right is None else np.column_stack([left, right]).ravel()
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1 if right is None else 2)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(frames.astype(np.int16).tobytes())
+
+
+FAKE_PYAUDIO = types.SimpleNamespace(paInt16=8, paContinue=0, paComplete=1)
+
+
+class FakeStream:
+    def __init__(self, pa, kwargs):
+        self.kwargs, self.out, self.active = kwargs, [], True
+        callback, frames = kwargs.get("stream_callback"), kwargs["frames_per_buffer"]
+        if kwargs.get("output") and callback is not None and pa.run_callbacks:
+            def loop():
+                while self.active:
+                    data, flag = callback(None, frames, None, None)
+                    self.out.append(data)
+                    if flag == FAKE_PYAUDIO.paComplete:
+                        break
+                    time.sleep(0.002)
+            threading.Thread(target=loop, daemon=True).start()
+
+    def stop_stream(self):
+        self.active = False
+
+    def close(self):
+        self.active = False
+
+
+class FakePA:
+    def __init__(self, run_callbacks=True):
+        self.streams, self.run_callbacks = [], run_callbacks
+
+    def open(self, **kwargs):
+        stream = FakeStream(self, kwargs)
+        self.streams.append(stream)
+        return stream
+
+
+def song_prop(tmp_path, jaw_channel="left", output="mix", url="ws://x"):
+    rate = 8000
+    t = np.arange(rate)  # one second
+    left = (np.sin(t * 0.3) * 12000).astype(np.int16)   # loud "vocals"
+    right = (np.sin(t * 0.05) * 1000).astype(np.int16)  # quiet "music"
+    write_wav(tmp_path / "song.wav", left, right, rate)
+    ini = tmp_path / "config.ini"
+    ini.write_text("[SONG]\nfile = song.wav\ntriggers = sing us a song, sing me a song\n"
+                   "jaw_channel = %s\noutput = %s\nafter_song = [The song ended.]\n" % (jaw_channel, output))
+    song = tp.load_song_config(str(ini))
+    args = tp.parse_args(["--url", url, "--no-servo", "--no-search"])
+    jaw = tp.Jaw(tp.load_chatterpi_config("/nonexistent.ini"), enabled=False)
+    moves = []
+    jaw.move = moves.append
+    prop = tp.TalkingProp(args, jaw, None, song)
+    prop.pyaudio, prop.pa = FAKE_PYAUDIO, FakePA()
+    return prop, moves
+
+
+def test_song_config_and_triggers(tmp_path):
+    prop, _ = song_prop(tmp_path)
+    song = prop.song
+    assert song["file"] == str(tmp_path / "song.wav")  # relative to config.ini
+    assert song["triggers"] == ["sing us a song", "sing me a song"]
+    assert song["button_pin"] == 0 and song["button_active_high"]
+    assert tp.heard_trigger("Captain! Sing us a song, please.", song["triggers"])
+    assert not tp.heard_trigger("I sing in the choir", song["triggers"])
+    assert tp.load_song_config("/nonexistent.ini")["file"] == ""
+
+
+def test_song_plays_jaw_follows_left_channel_and_mixes(tmp_path):
+    prop, moves = song_prop(tmp_path)
+    prop.play_song()
+    assert moves and min(moves) < 90  # jaw opened on the loud left channel
+    song_stream = prop.pa.streams[0]
+    assert song_stream.kwargs["channels"] == 2 and song_stream.kwargs["rate"] == 8000
+    audio = np.frombuffer(b"".join(song_stream.out), dtype=np.int16).reshape(-1, 2)
+    assert np.array_equal(audio[:, 0], audio[:, 1])  # mixed to both sides
+    assert not prop.song_active.is_set()
+    assert prop.pa.streams[-1].kwargs["stream_callback"] == prop.on_speaker  # conversation audio back
+
+
+def test_song_jaw_can_follow_right_channel(tmp_path):
+    prop, moves = song_prop(tmp_path, jaw_channel="right")
+    prop.play_song()
+    assert moves and min(moves) == 90  # right channel is too quiet to open the jaw
+
+
+def test_song_jaw_channel_defaults_to_right_like_chatterpi(tmp_path):
+    ini = tmp_path / "config.ini"
+    ini.write_text("[SONG]\nfile = song.wav\n")
+    assert tp.load_song_config(str(ini))["jaw_channel"] == "right"
+
+
+def test_song_stops_early(tmp_path):
+    prop, moves = song_prop(tmp_path)
+    prop.pa.run_callbacks = True
+    worker = threading.Thread(target=prop.play_song)
+    start = time.monotonic()
+    worker.start()
+    time.sleep(0.1)
+    prop.request_song_now()  # button press while playing = stop
+    worker.join(3)
+    assert not worker.is_alive() and time.monotonic() - start < 0.9
+
+
+def test_song_waits_for_spoken_intro(tmp_path):
+    prop, _ = song_prop(tmp_path)
+    prop.on_message(None, json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                                      "transcript": "Hey captain, sing us a song!"}))
+    assert prop.song_requested and not prop.song_ready()  # intro not spoken yet
+    prop.on_message(None, json.dumps({"type": "response.created"}))
+    prop.on_message(None, json.dumps({"type": "response.output_audio.delta",
+                                      "delta": base64.b64encode(b"\x01\x00" * 100).decode()}))
+    prop.on_message(None, json.dumps({"type": "response.done"}))
+    assert not prop.song_ready()  # intro audio still playing
+    with prop.play_lock:
+        del prop.play_buffer[:]
+    assert prop.song_ready()
+    assert prop.last_user_text == ""  # no search fallback on the trigger
+
+
+def test_conversation_audio_dropped_during_song(tmp_path):
+    prop, _ = song_prop(tmp_path)
+    prop.song_active.set()
+    prop.on_message(None, json.dumps({"type": "response.output_audio.delta",
+                                      "delta": base64.b64encode(b"\x01\x00" * 100).decode()}))
+    assert len(prop.play_buffer) == 0
+    assert prop.prop_is_talking()
+
+
+def test_song_line_added_to_instructions(tmp_path):
+    prop, _ = song_prop(tmp_path)
+    assert "If someone asks you to sing" in prop.session_update()["session"]["instructions"]
