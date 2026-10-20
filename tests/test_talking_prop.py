@@ -519,12 +519,12 @@ def song_prop(tmp_path, jaw_channel="left", output="mix", url="ws://x"):
 def test_song_config_and_triggers(tmp_path):
     prop, _ = song_prop(tmp_path)
     song = prop.song
-    assert song["file"] == str(tmp_path / "song.wav")  # relative to config.ini
+    assert song["files"] == [str(tmp_path / "song.wav")]  # relative to config.ini
     assert song["triggers"] == ["sing us a song", "sing me a song"]
     assert song["button_pin"] == 0 and song["button_active_high"]
     assert tp.heard_trigger("Captain! Sing us a song, please.", song["triggers"])
     assert not tp.heard_trigger("I sing in the choir", song["triggers"])
-    assert tp.load_song_config("/nonexistent.ini")["file"] == ""
+    assert tp.load_song_config("/nonexistent.ini")["files"] == []
 
 
 def test_song_plays_jaw_follows_left_channel_and_mixes(tmp_path):
@@ -591,3 +591,121 @@ def test_conversation_audio_dropped_during_song(tmp_path):
 def test_song_line_added_to_instructions(tmp_path):
     prop, _ = song_prop(tmp_path)
     assert "If someone asks you to sing" in prop.session_update()["session"]["instructions"]
+
+
+def test_songs_play_in_order_one_per_request(tmp_path):
+    prop, _ = song_prop(tmp_path)
+    rate = 8000
+    for name in ("b.wav", "c.wav"):
+        write_wav(tmp_path / name, np.zeros(rate // 10, dtype=np.int16), np.zeros(rate // 10, dtype=np.int16), rate)
+    ini = tmp_path / "config.ini"
+    ini.write_text("[SONG]\nfile = song.wav, b.wav , c.wav\n")
+    prop.song = tp.load_song_config(str(ini))
+    assert [os.path.basename(f) for f in prop.song["files"]] == ["song.wav", "b.wav", "c.wav"]
+    played = []
+    real_open = wave.open
+
+    def spy(path, mode="rb"):
+        played.append(os.path.basename(path))
+        return real_open(path, mode)
+
+    import unittest.mock as mock
+    with mock.patch("wave.open", side_effect=spy):
+        for _ in range(4):
+            prop.play_song()
+    assert played == ["song.wav", "b.wav", "c.wav", "song.wav"]  # one per request, then wraps round
+
+
+# ---------------------------------------------------------------- parrot sidekick
+def test_parrot_config(tmp_path):
+    jaw_settings = tp.load_chatterpi_config("/nonexistent.ini")
+    off = tp.load_parrot_config("/nonexistent.ini", jaw_settings)
+    assert off["enabled"] is False and off["beak"]["jaw_pin"] == 21 and off["name"] == "Polly"
+    ini = tmp_path / "config.ini"
+    ini.write_text("[PARROT]\nenabled = ON\nbeak_pin = 19\nname = Squawky\nchance = 0.3\nspeed = 1.6\nlevel1 = 900\n")
+    cfg = tp.load_parrot_config(str(ini), jaw_settings)
+    assert cfg["enabled"] and cfg["beak"]["jaw_pin"] == 19 and cfg["name"] == "Squawky"
+    assert (cfg["chance"], cfg["speed"]) == (0.3, 1.6)
+    assert cfg["beak"]["level1"] == 900 and cfg["beak"]["level2"] == jaw_settings["level2"]
+
+
+def test_speed_up_shortens_audio():
+    pcm = (np.sin(np.arange(1400) * 0.1) * 8000).astype(np.int16).tobytes()
+    assert len(tp.speed_up(pcm, 1.4)) == 1000 * 2
+    assert tp.speed_up(pcm, 1.0) == pcm
+
+
+class AlwaysRng:
+    def __init__(self, value):
+        self.value = value
+
+    def random(self):
+        return self.value
+
+
+def parrot_prop(chance_roll=0.0):
+    args = tp.parse_args(["--url", "ws://x", "--no-servo", "--no-search"])
+    jaw_settings = tp.load_chatterpi_config("/nonexistent.ini")
+    jaw = tp.Jaw(jaw_settings, enabled=False)
+    parrot = tp.load_parrot_config("/nonexistent.ini", jaw_settings)
+    parrot["enabled"] = True
+    beak = tp.Jaw(parrot["beak"], enabled=False)
+    jaw_moves, beak_moves, sent = [], [], []
+    jaw.move, beak.move = jaw_moves.append, beak_moves.append
+    prop = tp.TalkingProp(args, jaw, None, None, parrot, beak, rng=AlwaysRng(chance_roll))
+    prop.send = sent.append
+    prop.connected.set()
+    return prop, jaw_moves, beak_moves, sent
+
+
+def event(prop, **fields):
+    prop.on_message(None, json.dumps(fields))
+
+
+def loud(n=3200):
+    return base64.b64encode((np.sin(np.arange(n) * 0.3) * 12000).astype(np.int16).tobytes()).decode()
+
+
+def test_parrot_chimes_in_after_captain_and_moves_beak():
+    prop, jaw_moves, beak_moves, sent = parrot_prop(chance_roll=0.0)
+    event(prop, type="conversation.item.input_audio_transcription.completed", transcript="Where's the treasure?")
+    event(prop, type="response.created")
+    event(prop, type="response.output_audio.delta", delta=loud())
+    event(prop, type="response.output_audio_transcript.done", transcript="Buried on Skull Island, matey!")
+    event(prop, type="response.done")
+    assert prop.parrot_due
+    prop.parrot_turn()
+    prompt = sent[0]["item"]["content"][0]["text"]
+    assert "Buried on Skull Island" in prompt and "Where's the treasure?" in prompt and "Polly" in prompt
+    assert sent[1] == {"type": "response.create"}
+    event(prop, type="response.created")  # this one is the parrot's
+    event(prop, type="response.output_audio.delta", delta=loud(1400))
+    event(prop, type="response.output_audio_transcript.done", transcript="Skull Island? Ha! He can't find his own feet!")
+    event(prop, type="response.done")
+    assert len(prop.parrot_buffer) == 1000 * 2  # sped up 1.4x
+    assert not prop.parrot_due  # the parrot doesn't answer itself
+    assert prop.last_said == "Buried on Skull Island, matey!"
+    while prop.play_buffer or prop.parrot_buffer:
+        prop.on_speaker(None, 320, None, None)
+    assert jaw_moves and beak_moves
+    assert min(beak_moves) < 90  # beak opened
+
+
+def test_parrot_respects_chance_and_visitors():
+    prop, _, _, _ = parrot_prop(chance_roll=0.99)  # roll above the 0.5 chance: stays quiet
+    event(prop, type="response.created")
+    event(prop, type="response.output_audio_transcript.done", transcript="Arr.")
+    event(prop, type="response.done")
+    assert not prop.parrot_due
+    prop, _, _, _ = parrot_prop(chance_roll=0.0)
+    event(prop, type="response.created")
+    event(prop, type="response.output_audio_transcript.done", transcript="Arr.")
+    event(prop, type="response.done")
+    assert prop.parrot_due
+    event(prop, type="conversation.item.input_audio_transcription.completed", transcript="Hello again")
+    assert not prop.parrot_due  # a visitor spoke first
+
+
+def test_parrot_mentioned_in_captain_instructions():
+    prop, _, _, _ = parrot_prop()
+    assert "Polly" in prop.session_update()["session"]["instructions"]

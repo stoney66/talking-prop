@@ -104,16 +104,19 @@ def load_song_config(path):
     cfg.read(path)
     sec = cfg["SONG"] if cfg.has_section("SONG") else {}
     base = os.path.dirname(os.path.abspath(path))
-    song_file = str(sec.get("file", "")).strip()
-    if song_file and not os.path.isabs(song_file):
-        song_file = os.path.join(base, song_file)
+    # One file, or several separated by commas; each request plays the next one in order.
+    files = []
+    for name in str(sec.get("file", "")).split(","):
+        name = name.strip()
+        if name:
+            files.append(name if os.path.isabs(name) else os.path.join(base, name))
     triggers = [t.strip().lower() for t in str(sec.get("triggers", "")).split(",") if t.strip()]
     try:
         button_pin = int(sec.get("button_pin", 0) or 0)
     except ValueError:
         button_pin = 0
     return {
-        "file": song_file,
+        "files": files,
         "triggers": triggers,
         "button_pin": button_pin,
         "button_active_high": str(sec.get("button_active_high", "ON")).upper() == "ON",
@@ -122,6 +125,55 @@ def load_song_config(path):
         "output": "stereo" if str(sec.get("output", "mix")).lower() == "stereo" else "mix",
         "after": str(sec.get("after_song", "")).strip(),
     }
+
+
+DEFAULT_PARROT_PERSONA = (
+    "a sarcastic green parrot who rides on your shoulder, mocks you, repeats a word "
+    "or two of what you said, and thinks it is the real brains of the outfit"
+)
+
+
+def load_parrot_config(path, jaw_settings):
+    """Settings for the optional sidekick parrot from [PARROT]; its beak works like the jaw."""
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    sec = cfg["PARROT"] if cfg.has_section("PARROT") else {}
+
+    def num(key, default, kind=int):
+        try:
+            return kind(sec.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    beak = dict(jaw_settings)  # same loudness levels as the jaw unless overridden
+    beak.update({
+        "jaw_pin": num("beak_pin", 21),
+        "servo_min": num("servo_min", 1000),
+        "servo_max": num("servo_max", 2000),
+        "min_angle": num("min_angle", 0),
+        "max_angle": num("max_angle", 90),
+        "eyes": False,
+    })
+    for key in ("level1", "level2", "level3", "threshold", "style"):
+        beak[key] = num(key, beak[key])
+    return {
+        "enabled": str(sec.get("enabled", "OFF")).upper() == "ON",
+        "name": str(sec.get("name", "Polly")).strip() or "Polly",
+        "persona": str(sec.get("persona", "")).strip() or DEFAULT_PARROT_PERSONA,
+        "chance": min(1.0, max(0.0, num("chance", 0.5, float))),
+        "speed": min(2.0, max(1.0, num("speed", 1.4, float))),
+        "beak": beak,
+    }
+
+
+def speed_up(pcm, speed):
+    """Play audio faster, which also raises its pitch: the parrot's voice from the Captain's."""
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if speed <= 1.0 or len(samples) < 2:
+        return pcm
+    new_len = max(1, int(len(samples) / speed))
+    positions = np.linspace(0, len(samples) - 1, new_len)
+    return np.interp(positions, np.arange(len(samples)), samples).astype(np.int16).tobytes()
 
 
 def heard_trigger(transcript, triggers):
@@ -474,11 +526,21 @@ def upsample(samples, factor):
 # The conversation
 # --------------------------------------------------------------------------
 class TalkingProp:
-    def __init__(self, args, jaw, eyes=None, song=None):
+    def __init__(self, args, jaw, eyes=None, song=None, parrot=None, beak=None, rng=None):
         self.args = args
         self.jaw = jaw
         self.eyes = eyes
-        self.song = song if song and song.get("file") else None
+        self.parrot = parrot if parrot and parrot.get("enabled") else None
+        self.beak = beak                      # the parrot's servo (a Jaw on its own pin)
+        self.rng = rng or random.Random()
+        self.parrot_buffer = bytearray()      # sped-up parrot audio, played after the Captain's
+        self.parrot_due = False               # the parrot gets the next turn
+        self.parrot_asked = False             # we've asked the server for the parrot's line
+        self.parrot_speaking = False          # the response in progress is the parrot's
+        self.last_heard = ""                  # what the visitor last said (for the parrot)
+        self.last_said = ""                   # what the Captain last said (for the parrot)
+        self.song = song if song and song.get("files") else None
+        self.song_index = 0                   # which song in the list plays next
         self.song_active = threading.Event()  # the song is playing
         self.song_stop = threading.Event()    # stop the song early
         self.song_requested = 0.0             # when a song was asked for (0 = not asked)
@@ -515,13 +577,20 @@ class TalkingProp:
 
     def on_speaker(self, in_data, frame_count, time_info, status):
         want = (frame_count // self.out_factor) * 2  # bytes of 16 kHz audio
+        mouth = self.jaw
         with self.play_lock:
-            chunk = bytes(self.play_buffer[:want])
-            del self.play_buffer[:want]
+            if self.play_buffer or not self.parrot_buffer:
+                chunk = bytes(self.play_buffer[:want])
+                del self.play_buffer[:want]
+            else:  # the Captain has finished: now the parrot's line, with the beak moving
+                chunk = bytes(self.parrot_buffer[:want])
+                del self.parrot_buffer[:want]
+                mouth = self.beak
         samples = np.frombuffer(chunk, dtype=np.int16)
         if len(samples):
             self.last_audio_time = time.monotonic()
-            self.jaw.move(self.jaw.target(samples))
+            if mouth is not None:
+                mouth.move(mouth.target(samples))
             if self.args.debug:
                 self.reply_volumes.append(self.jaw.volume(samples))
         if len(chunk) < want:
@@ -533,7 +602,7 @@ class TalkingProp:
         if self.song_active.is_set():
             return True
         with self.play_lock:
-            pending = len(self.play_buffer) > 0
+            pending = len(self.play_buffer) > 0 or len(self.parrot_buffer) > 0
         return pending or (time.monotonic() - self.last_audio_time) < self.args.tail
 
     # ---- websocket ----
@@ -552,6 +621,13 @@ class TalkingProp:
         now = current_time()
         instructions += ("\n\nRight now it is %s on %s (%s). When asked the time or date, give exactly "
                          "this, in your own words; never guess it." % (now["time"], now["date"], now["timezone"]))
+        if self.parrot:
+            instructions += ("\n\nYour parrot, %s, rides on your shoulder and sometimes speaks after you; "
+                             "her lines are hers, not yours. You may talk about %s or grumble at her, but "
+                             "never narrate what she does or the sounds she makes: never write things like "
+                             "'%s squawks' or 'the parrot flaps', and never use the words 'squawk' or "
+                             "'squawks'. Only say your own words."
+                             % (self.parrot["name"], self.parrot["name"], self.parrot["name"]))
         if self.song and self.song["triggers"]:
             instructions += ("\n\nYou have a song you love to perform. If someone asks you to sing, never "
                              "refuse: reply with one short, eager line to introduce it, and the song "
@@ -642,13 +718,18 @@ class TalkingProp:
                 return  # never talk over the song
             pcm = base64.b64decode(event.get("delta", ""))
             with self.play_lock:
-                self.play_buffer.extend(pcm)
+                if self.parrot_speaking:
+                    self.parrot_buffer.extend(speed_up(pcm, self.parrot["speed"]))
+                else:
+                    self.play_buffer.extend(pcm)
         elif kind == "input_audio_buffer.speech_started":
             if self.args.barge_in:  # someone spoke over the prop: stop it
                 with self.play_lock:
                     del self.play_buffer[:]
         elif kind == "conversation.item.input_audio_transcription.completed":
             self.last_user_text = (event.get("transcript") or "").strip()
+            self.last_heard = self.last_user_text
+            self.parrot_due = False  # a visitor spoke: they come first
             print("You:   %s" % self.last_user_text)
             if (self.song and not self.song_active.is_set() and not self.song_requested
                     and heard_trigger(self.last_user_text, self.song["triggers"])):
@@ -658,20 +739,30 @@ class TalkingProp:
                 self.last_user_text = ""  # no search fallback for this one
         elif kind in ("response.output_audio_transcript.done", "response.audio_transcript.done"):
             reply = (event.get("transcript") or "").strip()
-            print("Prop:  %s" % reply)
-            self.promised = promised_to_search(reply)
+            if self.parrot_speaking:
+                print("%-6s %s" % (self.parrot["name"] + ":", reply))
+            else:
+                print("Prop:  %s" % reply)
+                self.promised = promised_to_search(reply)
+                self.last_said = reply
         elif kind == "response.created":
             self.response_idle.clear()
             self.called_tool = self.promised = False
+            self.parrot_speaking, self.parrot_asked = self.parrot_asked, False
         elif kind == "response.done":
             self.response_idle.set()
             if self.song_requested:
                 self.song_intro_done = True
-            if (self.promised and not self.called_tool and self.args.brave_key
-                    and self.args.search_fallback and self.last_user_text):
+            searching = (self.promised and not self.called_tool and self.args.brave_key
+                         and self.args.search_fallback and self.last_user_text)
+            if searching:
                 query, self.last_user_text = self.last_user_text, ""
                 threading.Thread(target=self.fallback_search, args=(query,), daemon=True).start()
+            elif (self.parrot and not self.parrot_speaking and not self.called_tool and self.last_said
+                  and not self.song_requested and self.rng.random() < self.parrot["chance"]):
+                self.parrot_due = True
             self.promised = False
+            self.parrot_speaking = False
         elif kind == "response.function_call_arguments.done":
             self.called_tool = True
             threading.Thread(target=self.run_tool, daemon=True,
@@ -758,6 +849,24 @@ class TalkingProp:
             except Exception:
                 pass
 
+    def parrot_turn(self):
+        """Ask the model for the parrot's line; its audio is sped up and moves the beak."""
+        self.parrot_due = False
+        name, said = self.parrot["name"], self.last_said
+        prompt = ("[Parrot's turn. Speak as %s, %s. The visitor said: %r. You (the main character) just "
+                  "said: %r. Give only the exact words %s says out loud: one short, sarcastic line under "
+                  "15 words that pokes fun at what you said. A bird noise like 'Rawk!' is fine. No name, "
+                  "no label, no narration and no description of what %s does.]"
+                  % (name, self.parrot["persona"], self.last_heard, said, name, name))
+        self.parrot_asked = True
+        try:
+            self.send({"type": "conversation.item.create",
+                       "item": {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": prompt}]}})
+            self.send({"type": "response.create"})
+        except Exception:
+            self.parrot_asked = False
+
     def request_song_now(self):
         """Button press: start the song right away, or stop it if it's playing."""
         if self.song_active.is_set():
@@ -767,6 +876,8 @@ class TalkingProp:
             print("Song started by button.")
             with self.play_lock:
                 del self.play_buffer[:]  # cut off anything the prop was saying
+                del self.parrot_buffer[:]
+            self.parrot_due = False
             self.song_requested = time.monotonic()
             self.song_intro_done = True
 
@@ -793,8 +904,10 @@ class TalkingProp:
         pyaudio = self.pyaudio
         song = self.song
         self.song_requested = 0.0
+        path = song["files"][self.song_index % len(song["files"])]
+        self.song_index = (self.song_index + 1) % len(song["files"])  # next request plays the next song
         try:
-            wav = wave.open(song["file"], "rb")
+            wav = wave.open(path, "rb")
         except (OSError, wave.Error) as exc:
             print("Can't play the song: %s" % exc)
             self.song_active.clear()
@@ -808,7 +921,7 @@ class TalkingProp:
         channels, rate = wav.getnchannels(), wav.getframerate()
         jaw_index = 1 if (channels == 2 and song["jaw_channel"] == "right") else 0
         out_channels = channels
-        print("Song: %s (%d ch, %d Hz, %.0f s)" % (os.path.basename(song["file"]), channels, rate,
+        print("Song: %s (%d ch, %d Hz, %.0f s)" % (os.path.basename(path), channels, rate,
                                                   wav.getnframes() / float(rate)))
         self.song_stop.clear()
         self.song_active.set()
@@ -869,6 +982,9 @@ class TalkingProp:
     def watch_speaking(self):
         """Light the eyes (if wired) while talking and relax the servo afterwards."""
         while not self.stop.is_set():
+            if (self.parrot_due and self.connected.is_set() and self.response_idle.is_set()
+                    and not self.prop_is_talking() and not self.song_requested):
+                self.parrot_turn()
             if self.song and self.song_ready():
                 self.song_requested = 0.0
                 self.song_active.set()  # claim it now so it can't start twice
@@ -890,6 +1006,8 @@ class TalkingProp:
                 if self.eyes is not None:
                     self.eyes.set_talking(False)
                 self.jaw.rest()
+                if self.beak is not None:
+                    self.beak.rest()
             self.is_speaking = talking
             time.sleep(0.05)
 
@@ -922,7 +1040,7 @@ class TalkingProp:
         self.open_speaker()
         button = self.start_button()  # noqa: F841 (kept alive for its callback)
         if self.song:
-            print("Song ready: %s%s" % (os.path.basename(self.song["file"]),
+            print("Songs ready, in order: %s%s" % (", ".join(os.path.basename(f) for f in self.song["files"]),
                                         ", say: " + " / ".join(self.song["triggers"]) if self.song["triggers"] else ""))
         workers = [self.run_socket, self.send_mic, self.watch_speaking, self.refresh_clock]
         if self.eyes is not None:
@@ -1018,6 +1136,7 @@ def parse_args(argv=None):
     p.add_argument("--no-servo", action="store_true", help="run without touching GPIO")
     p.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     p.add_argument("--jaw-test", action="store_true", help="step the jaw through its positions and exit")
+    p.add_argument("--parrot-test", action="store_true", help="step the parrot's beak through its positions and exit")
     p.add_argument("--sing", action="store_true",
                    help="play the [SONG] file once with the jaw and eye moving, then exit (no server needed)")
     p.add_argument("--eye-test", nargs="?", const="both", choices=("pan", "tilt", "both"),
@@ -1052,17 +1171,28 @@ def main():
     eyes = Eyes(load_eye_config(args.config), enabled=not args.no_servo)
     if args.eye_test:
         return eye_test(eyes, args.eye_test)
+    parrot = load_parrot_config(args.config, jaw.s)
+    beak = None
+    if parrot["enabled"] or args.parrot_test:
+        beak = Jaw(parrot["beak"], enabled=not args.no_servo)
+    if args.parrot_test:
+        return jaw_test(beak)
     song = load_song_config(args.config)
-    if song["file"] and not os.path.isfile(song["file"]):
-        print("Song file not found: %s (song mode off)" % song["file"])
+    for missing in [f for f in song["files"] if not os.path.isfile(f)]:
+        print("Song file not found, skipping: %s" % missing)
+    song["files"] = [f for f in song["files"] if os.path.isfile(f)]
+    if not song["files"]:
         song = None
     if args.sing:
-        if not song or not song["file"]:
+        if not song:
             raise SystemExit("No song. Set file = ... in the [SONG] section of config.ini.")
         return sing_once(args, jaw, eyes if eyes.active else None, song)
     if not args.url:
         raise SystemExit("No server URL. Pass --url ws://<server>:8765/v1/realtime or set TALKING_PROP_URL.")
-    TalkingProp(args, jaw, eyes if eyes.active else None, song).run()
+    if parrot["enabled"]:
+        print("Parrot %s on GPIO %d, chimes in after about %d%% of replies"
+              % (parrot["name"], parrot["beak"]["jaw_pin"], parrot["chance"] * 100))
+    TalkingProp(args, jaw, eyes if eyes.active else None, song, parrot, beak).run()
 
 
 def sing_once(args, jaw, eyes, song):

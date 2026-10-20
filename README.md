@@ -20,6 +20,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - [Install on the Pi](#install-on-the-pi)
 - [Run it](#run-it)
 - [Moving eye](#moving-eye)
+- [Sidekick parrot](#sidekick-parrot)
 - [Song mode](#song-mode)
 - [Personality](#personality)
 - [Web search](#web-search)
@@ -39,6 +40,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 - **Self-muting.** The mic is muted while the prop speaks so it doesn't answer itself.
 - **Optional moving eye** on two servos (side to side and up and down) that glances around while the prop talks.
 - **Optional LED eyes** that light while the prop talks.
+- **Sidekick parrot.** A second character on the same Pi and speaker, with its own beak servo, that chimes in with sarcastic one-liners after the main prop speaks.
 - **Song mode.** A trigger phrase or a button makes the prop perform a song from a WAV file, ChatterPi-style, then return to conversation.
 - **Reconnects on its own** if the server or network drops.
 
@@ -66,6 +68,7 @@ A Raspberry Pi handles the microphone, speaker and servo. All the heavy work (sp
 | LED eyes (optional) | GPIO 25 | Through a resistor. Set `eyes = ON` and `eyes_pin` in `config.ini`. |
 | Eye pan servo (optional) | GPIO 12 | Side to side. Set in `[EYE_SERVOS]`; see [Moving eye](#moving-eye). |
 | Eye tilt servo (optional) | GPIO 13 | Up and down. |
+| Parrot beak servo (optional) | GPIO 21 | Set in `[PARROT]`; see [Sidekick parrot](#sidekick-parrot). |
 
 ## Server setup
 
@@ -253,6 +256,7 @@ You'll see `Connected to ...`, then `You:` and `Prop:` lines as the conversation
 | `--no-search` | Turn web search off even if a key is present. |
 | `--no-servo` | Run without touching GPIO, e.g. on a desktop. |
 | `--list-devices` | Print audio devices and exit. |
+| `--parrot-test` | Step the parrot's beak through its positions and exit. |
 | `--sing` | Play the song once with jaw and eye, then exit. No server needed. |
 | `--eye-test [pan\|tilt]` | Move the eye servos through their range and exit. Add `pan` or `tilt` to move just that one. |
 | `--jaw-test` | Step the jaw through its positions and exit. |
@@ -301,6 +305,38 @@ python3 talking_prop.py --eye-test
 
 It looks left, right, up, down, then around the corners, and centres. To test one servo on its own, use `--eye-test pan` or `--eye-test tilt`; the other servo gets no signal. If a direction is reversed, set `pan_reverse = ON` or `tilt_reverse = ON`. If the eye hits the edge of the socket, lower `pan_range` or `tilt_range`, or narrow the pulse widths. `min_hold` and `max_hold` set how long it holds each glance.
 
+## Sidekick parrot
+
+A parrot (or any sidekick) can share the prop's Pi and speaker. After some of the main prop's replies it gets a turn: the model writes one short, sarcastic line for it based on what the visitor asked and what the main prop said, and it's played in the same cloned voice sped up, which raises the pitch into a bird-like squawk. Its beak servo moves with its audio; the jaw stays still. The two never talk over each other, and the main prop is told about the parrot so it can grumble back now and then.
+
+It needs no extra server or GPU memory: same connection, same voice. Add to `config.ini`:
+
+```ini
+[PARROT]
+enabled = ON
+beak_pin = 21
+name = Polly
+chance = 0.5
+speed = 1.4
+servo_min = 1000
+servo_max = 2000
+min_angle = 0
+max_angle = 90
+```
+
+- **`chance`**: how often it chimes in after a reply (0 to 1). It never interrupts a visitor, and it doesn't chime in during songs.
+- **`speed`**: how squeaky. 1.3 is mild, 1.6 is cartoonish.
+- **`persona`**: optional one-line description of who the parrot is.
+- **Beak calibration** works like the jaw: `servo_min`/`servo_max` and `min_angle`/`max_angle`, with the larger angle closed. Loudness levels default to the jaw's; override `level1` to `level3` under `[PARROT]` if the beak needs different ones.
+
+Check the beak with:
+
+```bash
+python3 talking_prop.py --parrot-test
+```
+
+In the log, the parrot's lines appear under its name.
+
 ## Song mode
 
 The prop can stop talking, perform a song, and go back to conversation afterwards. The song is a WAV file in ChatterPi's format: the right channel carries the vocals that drive the jaw, the left can carry backing music that doesn't move it. You can play along live.
@@ -326,6 +362,7 @@ During the song the mic is muted so the server doesn't hear the music, the eye g
 
 Details:
 
+- **Several songs:** list them, comma-separated: `file = angels.wav, shanty.wav, ghost.wav`. Each request plays the next one in order (the button too), and after the last it starts over. The order resets when the service restarts.
 - **Format:** 16-bit PCM WAV, mono or stereo, any sample rate. Convert with `ffmpeg -i in.mp3 -c:a pcm_s16le -ar 44100 song.wav`.
 - **`jaw_channel`:** the channel with the vocals. Defaults to `right`, the same as ChatterPi, so existing ChatterPi files work unchanged. Set `left` if your vocals are on the other side.
 - **`output`:** `mix` plays both channels on every speaker (right for one speaker), `stereo` keeps them separate.
