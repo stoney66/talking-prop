@@ -327,7 +327,8 @@ max_angle = 90
 - **`chance`**: how often it chimes in after a reply (0 to 1). It never interrupts a visitor, and it doesn't chime in during songs.
 - **`speed`**: how squeaky. 1.3 is mild, 1.6 is cartoonish.
 - **`persona`**: optional one-line description of who the parrot is.
-- **Beak calibration** works like the jaw: `servo_min`/`servo_max` and `min_angle`/`max_angle`, with the larger angle closed. Loudness levels default to the jaw's; override `level1` to `level3` under `[PARROT]` if the beak needs different ones.
+- **`squawk`**: optional recorded squawk WAV (or several, comma-separated, picked at random), played right before some of its lines with the beak moving. It also covers the pause while the line is generated. With a squawk set, the voice is told not to say "Rawk". `squawk_chance` (0 to 1, default 0.7) is how often a line starts with one. Any 16-bit WAV works; it's converted to mono 16 kHz on load. Free clips: search "parrot squawk" on freesound.org or pixabay.com/sound-effects, and trim to under a second.
+- **Beak calibration** works like the jaw: `servo_min`/`servo_max` and `min_angle`/`max_angle`, with the larger angle closed. Loudness levels default to the jaw's; override `level1` to `level3` under `[PARROT]` if the beak needs different ones. If the beak's linkage limits its travel, find the pulses where it's closed and open without the servo humming (`pigs s 21 <us>`, then `pigs s 21 0`), and use those.
 
 Check the beak with:
 

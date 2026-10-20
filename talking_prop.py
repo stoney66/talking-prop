@@ -156,7 +156,19 @@ def load_parrot_config(path, jaw_settings):
     })
     for key in ("level1", "level2", "level3", "threshold", "style"):
         beak[key] = num(key, beak[key])
+    squawks = []
+    for name in str(sec.get("squawk", "")).split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if not os.path.isabs(name):
+            name = os.path.join(os.path.dirname(os.path.abspath(path)), name)
+        pcm = load_clip(name)
+        if pcm:
+            squawks.append(pcm)
     return {
+        "squawks": squawks,
+        "squawk_chance": min(1.0, max(0.0, num("squawk_chance", 0.7, float))),
         "enabled": str(sec.get("enabled", "OFF")).upper() == "ON",
         "name": str(sec.get("name", "Polly")).strip() or "Polly",
         "persona": str(sec.get("persona", "")).strip() or DEFAULT_PARROT_PERSONA,
@@ -164,6 +176,28 @@ def load_parrot_config(path, jaw_settings):
         "speed": min(2.0, max(1.0, num("speed", 1.4, float))),
         "beak": beak,
     }
+
+
+def load_clip(path):
+    """A short 16-bit WAV as 16 kHz mono PCM bytes (the server's format), or b"" if unusable."""
+    import wave
+
+    try:
+        with wave.open(path, "rb") as wav:
+            if wav.getsampwidth() != 2:
+                print("Squawk %s must be 16-bit PCM WAV; convert it with: "
+                      "ffmpeg -i in.wav -c:a pcm_s16le -ac 1 -ar 16000 squawk.wav" % path)
+                return b""
+            channels, rate = wav.getnchannels(), wav.getframerate()
+            data = wav.readframes(wav.getnframes())
+    except (OSError, EOFError, wave.Error) as exc:
+        print("Can't load squawk %s: %s" % (path, exc))
+        return b""
+    samples = np.frombuffer(data, dtype=np.int16).reshape(-1, channels).astype(np.float64).mean(axis=1)
+    if rate != SERVER_RATE and len(samples) > 1:
+        new_len = max(1, int(len(samples) * SERVER_RATE / float(rate)))
+        samples = np.interp(np.linspace(0, len(samples) - 1, new_len), np.arange(len(samples)), samples)
+    return samples.astype(np.int16).tobytes()
 
 
 def speed_up(pcm, speed):
@@ -613,6 +647,9 @@ class TalkingProp:
 
     def session_update(self):
         output = {"format": {"type": "audio/pcm", "rate": None}}
+        transcription = {"model": "gpt-4o-transcribe"}
+        if self.args.language:  # some speech recognisers reject a language setting; send it only if asked
+            transcription["language"] = self.args.language
         if self.args.voice:
             output["voice"] = self.args.voice
         instructions = self.args.persona_text
@@ -640,7 +677,7 @@ class TalkingProp:
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": None},
-                        "transcription": {"model": "gpt-4o-transcribe", "language": self.args.language},
+                        "transcription": transcription,
                         "turn_detection": {"type": "server_vad", "interrupt_response": True},
                     },
                     "output": output,
@@ -768,7 +805,17 @@ class TalkingProp:
             threading.Thread(target=self.run_tool, daemon=True,
                              args=(event.get("name"), event.get("arguments"), event.get("call_id"))).start()
         elif kind == "error":
-            print("Server error: %s" % json.dumps(event.get("error", event)))
+            error = event.get("error", event)
+            message = str(error.get("message", "") if isinstance(error, dict) else error)
+            print("Server error: %s" % json.dumps(error))
+            if self.args.language and "language" in message.lower() and "not supported" in message.lower():
+                # The whole session setup was rejected, persona included: retry without the language.
+                print("Retrying the session without --language %s" % self.args.language)
+                self.args.language = ""
+                try:
+                    self.send(self.session_update())
+                except Exception:
+                    pass
         elif self.args.debug:
             print("event: %s" % kind)
 
@@ -853,11 +900,20 @@ class TalkingProp:
         """Ask the model for the parrot's line; its audio is sped up and moves the beak."""
         self.parrot_due = False
         name, said = self.parrot["name"], self.last_said
+        squawks = self.parrot.get("squawks") or []
+        if squawks:  # a real recorded squawk does the bird noise, so the voice must not
+            noise = "Words only: no bird noises such as 'Rawk' or 'squawk'."
+        else:
+            noise = "A bird noise like 'Rawk!' is fine."
         prompt = ("[Parrot's turn. Speak as %s, %s. The visitor said: %r. You (the main character) just "
                   "said: %r. Give only the exact words %s says out loud: one short, sarcastic line under "
-                  "15 words that pokes fun at what you said. A bird noise like 'Rawk!' is fine. No name, "
+                  "15 words that pokes fun at what you said. %s No name, "
                   "no label, no narration and no description of what %s does.]"
-                  % (name, self.parrot["persona"], self.last_heard, said, name, name))
+                  % (name, self.parrot["persona"], self.last_heard, said, name, noise, name))
+        if squawks and self.rng.random() < self.parrot.get("squawk_chance", 0.7):
+            # Plays straight away (while the line is generated), moving the beak like speech.
+            with self.play_lock:
+                self.parrot_buffer.extend(self.rng.choice(squawks))
         self.parrot_asked = True
         try:
             self.send({"type": "conversation.item.create",
@@ -1121,7 +1177,8 @@ def parse_args(argv=None):
     p.add_argument("--token", default=os.getenv("TALKING_PROP_TOKEN", "DUMMY"),
                    help="bearer token, if the server wants one")
     p.add_argument("--voice", default=os.getenv("TALKING_PROP_VOICE", ""), help="voice name known to the s2s server")
-    p.add_argument("--language", default="en", help="transcription language")
+    p.add_argument("--language", default="",
+                   help="speech recognition language, e.g. en (default: let the server decide)")
     p.add_argument("--persona", default=os.path.join(HERE, "persona.txt"), help="file with the personality text")
     p.add_argument("--config", default=os.path.join(HERE, "config.ini"), help="ChatterPi config.ini to reuse")
     p.add_argument("--mic-rate", type=int, default=16000, help="mic sample rate: 16000, 32000 or 48000")
